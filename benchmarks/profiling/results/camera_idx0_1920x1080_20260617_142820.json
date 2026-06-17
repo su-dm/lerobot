@@ -1,0 +1,65 @@
+{
+  "schema": "lerobot.camera_bench.v1",
+  "created": "2026-06-17T14:28:08",
+  "platform": "macOS-14.4-arm64-arm-64bit-Mach-O",
+  "opencv_version": "4.13.0",
+  "index": 0,
+  "runs": [
+    {
+      "requested": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "fourcc": "MJPG"
+      },
+      "negotiated": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30.00003,
+        "fourcc": "\u0000\u0000\u0000\u0000",
+        "backend": "AVFOUNDATION"
+      },
+      "frames_read": 120,
+      "read_ms": {
+        "mean": 33.14900558167816,
+        "p50": 33.05268749682,
+        "p95": 36.79987324940157,
+        "min": 19.48333300242666,
+        "max": 45.60499999206513
+      },
+      "sustained_fps": 30.166817449049258,
+      "cvtColor_bgr2rgb_ms": {
+        "mean": 0.7054222655521395,
+        "p95": 1.1711649422068133
+      }
+    },
+    {
+      "requested": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "fourcc": "none"
+      },
+      "negotiated": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30.00003,
+        "fourcc": "\u0000\u0000\u0000\u0000",
+        "backend": "AVFOUNDATION"
+      },
+      "frames_read": 120,
+      "read_ms": {
+        "mean": 34.90732537490354,
+        "p50": 33.712853997712955,
+        "p95": 47.20743956204387,
+        "min": 25.423833998502232,
+        "max": 60.24691699713003
+      },
+      "sustained_fps": 28.647282175303676,
+      "cvtColor_bgr2rgb_ms": {
+        "mean": 1.1134263666463085,
+        "p95": 1.917162654717684
+      }
+    }
+  ]
+}

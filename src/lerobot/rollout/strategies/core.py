@@ -282,13 +282,18 @@ def send_next_action(
     Returns the action dict that was sent, or ``None`` if no action was
     ready (e.g. empty async queue, interpolator not yet primed).
     """
+    from lerobot.utils.profiler import get_profiler
+
+    prof = get_profiler()
     engine = ctx.policy.inference
     features = ctx.data.dataset_features
     ordered_keys = ctx.data.ordered_action_keys
 
     if interpolator.needs_new_action():
-        obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-        action_tensor = engine.get_action(obs_frame)
+        with prof.stage("dispatch.build_dataset_frame"):
+            obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
+        with prof.stage("dispatch.get_action", sync=True):
+            action_tensor = engine.get_action(obs_frame)
         if action_tensor is not None:
             interpolator.add(action_tensor.cpu())
 
@@ -299,6 +304,8 @@ def send_next_action(
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
-    processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-    ctx.hardware.robot_wrapper.send_action(processed)
+    with prof.stage("dispatch.robot_action_processor"):
+        processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+    with prof.stage("dispatch.robot_send"):
+        ctx.hardware.robot_wrapper.send_action(processed)
     return action_dict

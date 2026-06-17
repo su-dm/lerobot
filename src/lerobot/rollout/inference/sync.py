@@ -25,6 +25,7 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.utils.profiler import get_profiler
 
 from .base import InferenceEngine
 
@@ -102,21 +103,29 @@ class SyncInferenceEngine(InferenceEngine):
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
         # tensor/array values are not shared with any other reader.
         observation = copy(obs_frame)
+        prof = get_profiler()
         autocast_ctx = (
             torch.autocast(device_type=self._device.type)
             if self._device.type == "cuda" and self._policy.config.use_amp
             else nullcontext()
         )
         with torch.inference_mode(), autocast_ctx:
-            observation = prepare_observation_for_inference(
-                observation, self._device, self._task, self._robot_type
-            )
-            observation = self._preprocessor(observation)
-            action = self._policy.select_action(observation)
-            action = self._postprocessor(action)
-        action_tensor = action.squeeze(0).cpu()
+            with prof.stage("infer.prepare_observation"):
+                observation = prepare_observation_for_inference(
+                    observation, self._device, self._task, self._robot_type
+                )
+            with prof.stage("infer.preprocess", sync=True):
+                observation = self._preprocessor(observation)
+            with prof.stage("infer.select_action", sync=True):
+                action = self._policy.select_action(observation)
+            with prof.stage("infer.postprocess", sync=True):
+                action = self._postprocessor(action)
+        with prof.stage("infer.to_cpu", sync=True):
+            action_tensor = action.squeeze(0).cpu()
 
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
-        action_dict = make_robot_action(action_tensor, self._dataset_features)
-        return torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+        with prof.stage("infer.make_robot_action"):
+            action_dict = make_robot_action(action_tensor, self._dataset_features)
+            result = torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+        return result

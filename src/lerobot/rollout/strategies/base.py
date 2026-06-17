@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import time
 
+from lerobot.utils.profiler import init_profiler
 from lerobot.utils.robot_utils import precise_sleep
 
 from ..context import RolloutContext
@@ -48,6 +49,19 @@ class BaseStrategy(RolloutStrategy):
 
         control_interval = interpolator.get_control_interval(cfg.fps)
 
+        prof = init_profiler(
+            device=cfg.device,
+            meta={
+                "source": "base_strategy",
+                "fps": cfg.fps,
+                "interpolation_multiplier": cfg.interpolation_multiplier,
+                "robot": cfg.robot.type if cfg.robot else None,
+                "policy_type": getattr(cfg.policy, "type", None),
+                "policy_path": getattr(cfg.policy, "pretrained_path", None),
+                "use_torch_compile": cfg.use_torch_compile,
+            },
+        )
+
         start_time = time.perf_counter()
         engine.resume()
         logger.info("Base strategy control loop started")
@@ -59,18 +73,23 @@ class BaseStrategy(RolloutStrategy):
                 logger.info("Duration limit reached (%.0fs)", cfg.duration)
                 break
 
-            obs = robot.get_observation()
-            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+            with prof.stage("loop.get_observation"):
+                obs = robot.get_observation()
+            with prof.stage("loop.observation_processor"):
+                obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
             if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
 
-            action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+            with prof.stage("loop.send_next_action", sync=True):
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
             self._log_telemetry(obs_processed, action_dict, ctx.runtime)
 
             dt = time.perf_counter() - loop_start
+            prof.record("loop.compute", dt)
             if (sleep_t := control_interval - dt) > 0:
-                precise_sleep(sleep_t)
+                with prof.stage("loop.sleep"):
+                    precise_sleep(sleep_t)
             else:
                 logger.warning(
                     f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
