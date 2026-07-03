@@ -28,6 +28,7 @@ from threading import Event
 
 import draccus
 
+from lerobot.configs import FeatureType
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
@@ -62,6 +63,20 @@ class InferenceEngineConfig(draccus.ChoiceRegistry, abc.ABC):
 class SyncInferenceConfig(InferenceEngineConfig):
     """Inline synchronous inference (one policy call per control tick)."""
 
+    # When True, observation images are resized on-device to the policy's
+    # expected input resolution (derived from the policy config). This lets a
+    # high-resolution camera feed a lower-resolution policy and shrinks the
+    # host->device upload. Disabled by default to preserve exact behaviour
+    # (the camera is expected to already capture at the policy resolution).
+    resize_observation_images: bool = False
+
+    # When True, postprocessed action chunks are cached locally and served one
+    # per tick, so the policy (and the per-tick image upload + normalize) only
+    # runs when the cache is empty. Currently supported only for ACT policies
+    # without temporal ensembling, where it is behaviour-preserving. Disabled by
+    # default; the factory raises for unsupported policies.
+    chunked_action_cache: bool = False
+
 
 @InferenceEngineConfig.register_subclass("rtc")
 @dataclass
@@ -77,6 +92,34 @@ class RTCInferenceConfig(InferenceEngineConfig):
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
+
+def _resolve_chunk_action_steps(policy_config) -> int:
+    """Validate the policy and return how many chunk actions to cache per query.
+
+    The chunked-action cache bypasses ``select_action``, so it is only enabled
+    for policies where serving a cached chunk is behaviour-preserving. Today
+    that is ACT without temporal ensembling: ``select_action`` ignores the
+    observation while its internal queue is non-empty, and the postprocessor is
+    a stateless per-action transform. Anything else raises a clear error.
+    """
+    policy_type = getattr(policy_config, "type", None)
+    if policy_type != "act":
+        raise ValueError(
+            f"chunked_action_cache currently supports only ACT policies, got '{policy_type}'. "
+            "Disable inference.chunked_action_cache for this policy."
+        )
+    if getattr(policy_config, "temporal_ensemble_coeff", None) is not None:
+        raise ValueError(
+            "chunked_action_cache is incompatible with ACT temporal ensembling: the ensembler "
+            "requires a fresh forward pass every step. Disable one of the two."
+        )
+    n_action_steps = getattr(policy_config, "n_action_steps", None)
+    if not isinstance(n_action_steps, int) or n_action_steps < 1:
+        raise ValueError(
+            f"chunked_action_cache requires a positive integer n_action_steps, got {n_action_steps!r}."
+        )
+    return n_action_steps
 
 
 def create_inference_engine(
@@ -99,6 +142,14 @@ def create_inference_engine(
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
     if isinstance(config, SyncInferenceConfig):
+        image_resize_shapes = None
+        if config.resize_observation_images:
+            image_resize_shapes = {
+                k: v.shape for k, v in policy.config.input_features.items() if v.type == FeatureType.VISUAL
+            }
+        chunk_action_steps = None
+        if config.chunked_action_cache:
+            chunk_action_steps = _resolve_chunk_action_steps(policy.config)
         return SyncInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
@@ -108,6 +159,8 @@ def create_inference_engine(
             task=task,
             device=device,
             robot_type=robot_wrapper.robot_type,
+            image_resize_shapes=image_resize_shapes,
+            chunk_action_steps=chunk_action_steps,
         )
     if isinstance(config, RTCInferenceConfig):
         return RTCInferenceEngine(

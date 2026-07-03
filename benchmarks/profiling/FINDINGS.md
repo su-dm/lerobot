@@ -152,6 +152,75 @@ Run ~30–60 s, Ctrl-C (exits cleanly, writes JSON). Then
 6. **Do NOT pursue fp16 autocast on MPS** — measured slower. Revisit only with a
    dtype-correct static-half model and re-measure.
 
+---
+
+## Image-pipeline code audit (low-level)
+
+Per-tick image journey @1080p (measured ~13.8 ms CPU+transfer, every tick):
+
+| Stage                     | Where                              | Cost          | Notes                                        |
+| ------------------------- | ---------------------------------- | ------------- | -------------------------------------------- |
+| `cvtColor` BGR→RGB        | `camera_opencv.py:427` (bg thread) | ~0.7 ms/frame | full-image CPU op                            |
+| `read_latest`             | `camera_opencv.py:571`             | ~0            | returns reference, no copy (good)            |
+| `build_dataset_frame`     | `feature_utils.py:116`             | ~0.02 ms      | reference only                               |
+| `from_numpy`              | `utils.py:127`                     | ~0            | zero-copy view                               |
+| `.type(float32)/255`      | `utils.py:129`                     | several ms    | allocates ~25 MB float32 HWC on CPU          |
+| `.permute().contiguous()` | `utils.py:130`                     | several ms    | ~25 MB CPU memcpy to CHW                     |
+| `.to(device)`             | `utils.py:132`                     | transfer      | 25 MB float32 host→device                    |
+| `AddBatchDimension`       | `batch_processor.py:111`           | ~0            | image already 4D → skipped (no double-batch) |
+| `DeviceProcessorStep`     | `device_processor.py:122`          | ~0            | re-iterates, `.to` is no-op (redundant)      |
+| `Normalizer` (MEAN_STD)   | `normalize_processor.py:362`       | GPU           | `(x-mean)/std`, allocates intermediates      |
+
+### Findings / fixes (ranked)
+
+- **A. Transfer uint8, convert on-device. [DONE]** `prepare_observation_for_inference`
+  now uploads the raw uint8 (H,W,C) frame to the device first, then does the float
+  cast / `/255` / permute / contiguous on the accelerator. 4× smaller host→device
+  copy + per-pixel work off the CPU. Numerically identical (test-verified against the
+  old host-side path). (`policies/utils.py`)
+- **C. Avoid CPU `contiguous`. [DONE]** Folded into A — the `contiguous()` repack now
+  runs on-device, removing the ~25 MB CPU memcpy that showed in cProfile.
+- **G. `non_blocking` H2D. [PARTIAL/DONE]** Transfers use `non_blocking=True` on CUDA
+  (no-op on MPS/CPU). Manual buffer reuse skipped on purpose: the caching allocator
+  already recycles per-tick tensors and manual reuse risks aliasing under
+  `inference_mode`. Pinned staging is a CUDA-only follow-up.
+- **Sync-path resize (rec #2). [DONE]** Opt-in `--inference.resize_observation_images`
+  resizes images on-device (bilinear) to the policy's input resolution, derived from
+  the policy config (parity with the async path). Lets a high-res camera feed a
+  low-res policy and shrinks the upload. Default off (exact prior behaviour).
+- **D. Skip preprocessing on cached-action ticks. [DONE for ACT, opt-in].** Enabled via
+  `--inference.chunked_action_cache`. The sync engine now drives the policy with
+  `predict_action_chunk` (sliced to `n_action_steps`), postprocesses the whole chunk
+  once, and serves CPU actions from a local FIFO — so the per-tick image upload +
+  normalize only runs when the cache is empty (every `n_action_steps` ticks instead of
+  every tick). This is **behaviour-preserving** for ACT without temporal ensembling:
+  `select_action` already ignores the observation while its internal `_action_queue` is
+  non-empty, and the postprocessor is a stateless per-action transform. The factory
+  refuses unsupported configs with a clear error: non-ACT policies (SAC's
+  `predict_action_chunk` raises; Diffusion-family populate obs-history queues inside
+  `select_action`) and ACT with temporal ensembling (the ensembler needs a fresh
+  forward every step). Relative-action policies are already rejected for sync.
+- **B. Fuse /255 + normalize into one affine. [WON'T DO].** Would couple
+  `prepare_observation` to the policy's normalization stats, breaking the
+  `NormalizerProcessorStep` abstraction, for a marginal saving (both passes are cheap
+  GPU kernels after A). Not worth the design cost.
+- **E. Drop redundant device pass. [NO CHANGE NEEDED].** `DeviceProcessorStep`
+  short-circuits when the tensor is already on-device (it's a no-op `.to`), and the
+  step is part of the serialized pipeline, so removing it would break loading.
+- **F. Fuse the BGR→RGB swap. [WON'T DO].** `cvtColor` runs in the camera background
+  thread — off the control-loop critical path (~0 latency impact) — and the same
+  frame is written to datasets expecting RGB. Changing it is cross-cutting correctness
+  risk for no loop-time gain.
+
+### Camera-resolution clarification
+
+`OpenCVCamera._validate_width_and_height` (`camera_opencv.py:267-289`) **raises** if
+the hardware does not honor the requested size. So setting `width/height` in the
+camera config is real source-level downscaling (camera captures native small frame →
+model sees small frame). The "sync-path resize" (rec #2) is a _separate_ software
+resize **after** capture — only useful when you must capture high-res but infer small.
+If you already lower the camera, the resize step is a no-op for you.
+
 ```
 
 ```

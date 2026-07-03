@@ -251,6 +251,182 @@ def test_create_inference_engine_sync():
     assert isinstance(engine, SyncInferenceEngine)
 
 
+def _make_sync_engine(resize: bool):
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+
+    policy = MagicMock()
+    policy.config.input_features = {
+        "observation.images.cam": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 240, 320)),
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+    }
+    return create_inference_engine(
+        SyncInferenceConfig(resize_observation_images=resize),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="mock"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="test",
+        fps=30.0,
+        device="cpu",
+    )
+
+
+def test_sync_engine_resize_disabled_by_default():
+    engine = _make_sync_engine(resize=False)
+    assert engine._image_resize_shapes is None
+
+
+def test_sync_engine_resize_shapes_from_policy_visual_features():
+    engine = _make_sync_engine(resize=True)
+    # Only VISUAL features contribute resize targets; state must be excluded.
+    assert engine._image_resize_shapes == {"observation.images.cam": (3, 240, 320)}
+
+
+# ---------------------------------------------------------------------------
+# Chunked action cache (finding D)
+# ---------------------------------------------------------------------------
+
+
+def _make_act_policy_config(n_action_steps=50, temporal_ensemble_coeff=None):
+    cfg = MagicMock()
+    cfg.type = "act"
+    cfg.n_action_steps = n_action_steps
+    cfg.temporal_ensemble_coeff = temporal_ensemble_coeff
+    return cfg
+
+
+def _make_chunk_engine(policy_config, *, chunked=True):
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+
+    policy = MagicMock()
+    policy.config = policy_config
+    return create_inference_engine(
+        SyncInferenceConfig(chunked_action_cache=chunked),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="mock"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="test",
+        fps=30.0,
+        device="cpu",
+    )
+
+
+def test_chunked_cache_disabled_by_default():
+    engine = _make_chunk_engine(_make_act_policy_config(), chunked=False)
+    assert engine._chunk_action_steps is None
+
+
+def test_chunked_cache_resolves_n_action_steps_for_act():
+    engine = _make_chunk_engine(_make_act_policy_config(n_action_steps=42))
+    assert engine._chunk_action_steps == 42
+
+
+def test_chunked_cache_rejects_non_act_policy():
+    cfg = MagicMock()
+    cfg.type = "diffusion"
+    with pytest.raises(ValueError, match="only ACT policies"):
+        _make_chunk_engine(cfg)
+
+
+def test_chunked_cache_rejects_temporal_ensembling():
+    cfg = _make_act_policy_config(n_action_steps=1, temporal_ensemble_coeff=0.01)
+    with pytest.raises(ValueError, match="temporal ensembling"):
+        _make_chunk_engine(cfg)
+
+
+def _build_chunk_engine_with_stub_policy(n_action_steps, chunk_len, action_dim):
+    """Build a SyncInferenceEngine in chunked mode with a deterministic stub policy."""
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    # predict_action_chunk returns row t == [t*10, t*10+1, ...] so order is checkable.
+    chunk = torch.stack(
+        [torch.arange(action_dim, dtype=torch.float32) + t * 10 for t in range(chunk_len)]
+    ).unsqueeze(0)  # (1, chunk_len, action_dim)
+
+    policy = MagicMock()
+    policy.predict_action_chunk = MagicMock(return_value=chunk)
+
+    action_names = [f"a{i}" for i in range(action_dim)]
+    dataset_features = {ACTION: {"names": action_names, "dtype": "float32", "shape": (action_dim,)}}
+
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(side_effect=lambda x: x),
+        postprocessor=MagicMock(side_effect=lambda x: x),
+        dataset_features=dataset_features,
+        ordered_action_keys=action_names,
+        task="test",
+        device="cpu",
+        robot_type="mock",
+        chunk_action_steps=n_action_steps,
+    )
+    return engine, policy
+
+
+def test_chunked_cache_serves_from_cache_and_refills():
+    import numpy as np
+
+    engine, policy = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
+    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
+
+    # First call runs the policy and caches n_action_steps actions.
+    a0 = engine.get_action(obs_frame)
+    assert policy.predict_action_chunk.call_count == 1
+    torch.testing.assert_close(a0, torch.tensor([0.0, 1.0]))
+
+    # Next two calls are served from the cache (policy NOT re-run).
+    a1 = engine.get_action(obs_frame)
+    a2 = engine.get_action(obs_frame)
+    assert policy.predict_action_chunk.call_count == 1
+    torch.testing.assert_close(a1, torch.tensor([10.0, 11.0]))
+    torch.testing.assert_close(a2, torch.tensor([20.0, 21.0]))
+
+    # Cache exhausted -> policy runs again, slice restarts at row 0.
+    a3 = engine.get_action(obs_frame)
+    assert policy.predict_action_chunk.call_count == 2
+    torch.testing.assert_close(a3, torch.tensor([0.0, 1.0]))
+
+
+def test_chunked_cache_slices_to_n_action_steps():
+    import numpy as np
+
+    # chunk has 5 rows but n_action_steps=2 -> only 2 cached before refilling.
+    engine, policy = _build_chunk_engine_with_stub_policy(n_action_steps=2, chunk_len=5, action_dim=2)
+    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
+
+    engine.get_action(obs_frame)
+    engine.get_action(obs_frame)
+    assert policy.predict_action_chunk.call_count == 1
+    engine.get_action(obs_frame)  # cache empty after 2 -> refill
+    assert policy.predict_action_chunk.call_count == 2
+
+
+def test_chunked_cache_none_obs_returns_none_without_running_policy():
+    engine, policy = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
+    assert engine.get_action(None) is None
+    assert policy.predict_action_chunk.call_count == 0
+
+
+def test_reset_clears_action_cache():
+    import numpy as np
+
+    engine, policy = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
+    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
+    engine.get_action(obs_frame)  # fills cache (2 left)
+    assert len(engine._action_cache) == 2
+    engine.reset()
+    assert len(engine._action_cache) == 0
+
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------

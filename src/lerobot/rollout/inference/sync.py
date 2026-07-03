@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
 from copy import copy
 
@@ -32,19 +33,14 @@ from .base import InferenceEngine
 logger = logging.getLogger(__name__)
 
 
-# TODO(Steven): support relative-action policies.  The per-tick flow refreshes
-# ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
-# actions popped on later ticks get reanchored to the *current* robot state and
-# absolute targets drift through the chunk.  Relative-action policies are
-# rejected at context-build time today; RTC postprocesses the whole chunk and
-# is unaffected.
-#
-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
-# local FIFO of postprocessed actions.  Eliminates drift by construction and
-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
-# ``select_action``), and Diffusion-family (obs-history queues populated as a
-# side effect of ``select_action``).
+# NOTE: ``chunk_action_steps`` enables the "chunked action cache" fast path (see
+# ``_get_action_chunked``).  It is opt-in via ``SyncInferenceConfig`` and the
+# factory only enables it for policies where it is provably behaviour-preserving
+# (currently ACT without temporal ensembling).  It bypasses ``select_action`` —
+# which is unsafe for SAC (``predict_action_chunk`` raises), ACT temporal
+# ensembling (the ensembler lives in ``select_action``), Diffusion-family
+# (obs-history queues populated as a side effect of ``select_action``), and
+# relative-action policies (the postprocessor reanchors per call).
 
 
 class SyncInferenceEngine(InferenceEngine):
@@ -53,6 +49,11 @@ class SyncInferenceEngine(InferenceEngine):
     ``get_action`` runs the full policy pipeline (pre/post-processor +
     ``select_action``) on the given observation frame and returns a
     CPU action tensor reordered to match the dataset action keys.
+
+    When ``chunk_action_steps`` is set, ``get_action`` instead serves actions
+    from a locally cached chunk (see :meth:`_get_action_chunked`): the policy is
+    queried via ``predict_action_chunk`` only when the cache is empty, so the
+    per-tick image upload + normalize is skipped while cached actions remain.
     """
 
     def __init__(
@@ -65,6 +66,8 @@ class SyncInferenceEngine(InferenceEngine):
         task: str,
         device: str | None,
         robot_type: str,
+        image_resize_shapes: dict[str, tuple[int, ...]] | None = None,
+        chunk_action_steps: int | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -74,10 +77,17 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        self._image_resize_shapes = image_resize_shapes
+        self._chunk_action_steps = chunk_action_steps
+        # Local cache of postprocessed, CPU-side, reordered action rows. Only
+        # used when ``chunk_action_steps`` is set.
+        self._action_cache: deque[torch.Tensor] = deque()
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
+            "SyncInferenceEngine initialized (device=%s, action_keys=%d, resize_images=%s, chunk_steps=%s)",
             self._device,
             len(ordered_action_keys),
+            bool(image_resize_shapes),
+            chunk_action_steps,
         )
 
     def start(self) -> None:
@@ -94,9 +104,16 @@ class SyncInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        self._action_cache.clear()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
-        """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
+        """Return the next action, reordered to match the dataset action keys."""
+        if self._chunk_action_steps is not None:
+            return self._get_action_chunked(obs_frame)
+        return self._get_action_single(obs_frame)
+
+    def _get_action_single(self, obs_frame: dict | None) -> torch.Tensor | None:
+        """Run the full inference pipeline on ``obs_frame`` and return one action."""
         if obs_frame is None:
             return None
         # Shallow copy is intentional: the caller (`send_next_action`) builds
@@ -104,15 +121,14 @@ class SyncInferenceEngine(InferenceEngine):
         # tensor/array values are not shared with any other reader.
         observation = copy(obs_frame)
         prof = get_profiler()
-        autocast_ctx = (
-            torch.autocast(device_type=self._device.type)
-            if self._device.type == "cuda" and self._policy.config.use_amp
-            else nullcontext()
-        )
-        with torch.inference_mode(), autocast_ctx:
+        with torch.inference_mode(), self._autocast_ctx():
             with prof.stage("infer.prepare_observation"):
                 observation = prepare_observation_for_inference(
-                    observation, self._device, self._task, self._robot_type
+                    observation,
+                    self._device,
+                    self._task,
+                    self._robot_type,
+                    image_resize_shapes=self._image_resize_shapes,
                 )
             with prof.stage("infer.preprocess", sync=True):
                 observation = self._preprocessor(observation)
@@ -129,3 +145,59 @@ class SyncInferenceEngine(InferenceEngine):
             action_dict = make_robot_action(action_tensor, self._dataset_features)
             result = torch.tensor([action_dict[k] for k in self._ordered_action_keys])
         return result
+
+    def _get_action_chunked(self, obs_frame: dict | None) -> torch.Tensor | None:
+        """Serve the next action from the local chunk cache, refilling when empty.
+
+        This mirrors ACT's internal ``_action_queue`` semantics
+        (``predict_action_chunk`` sliced to ``n_action_steps``) but caches the
+        *postprocessed* actions here.  On ticks served from the cache, the
+        expensive image upload + normalize is skipped entirely.  This is
+        behaviour-preserving for policies whose ``select_action`` ignores the
+        observation while its internal queue is non-empty (validated for ACT
+        without temporal ensembling in the factory).
+        """
+        if not self._action_cache:
+            if obs_frame is None:
+                return None
+            self._action_cache.extend(self._run_policy_chunk(obs_frame))
+        if not self._action_cache:
+            return None
+        return self._action_cache.popleft()
+
+    def _run_policy_chunk(self, obs_frame: dict) -> list[torch.Tensor]:
+        """Run the policy once and return a list of postprocessed, reordered action rows."""
+        observation = copy(obs_frame)
+        prof = get_profiler()
+        with torch.inference_mode(), self._autocast_ctx():
+            with prof.stage("infer.prepare_observation"):
+                observation = prepare_observation_for_inference(
+                    observation,
+                    self._device,
+                    self._task,
+                    self._robot_type,
+                    image_resize_shapes=self._image_resize_shapes,
+                )
+            with prof.stage("infer.preprocess", sync=True):
+                observation = self._preprocessor(observation)
+            with prof.stage("infer.predict_chunk", sync=True):
+                actions = self._policy.predict_action_chunk(observation)
+                actions = actions[:, : self._chunk_action_steps]
+            with prof.stage("infer.postprocess", sync=True):
+                actions = self._postprocessor(actions)
+        with prof.stage("infer.to_cpu", sync=True):
+            # (B=1, T, A) -> (T, A) on CPU.
+            actions = actions.squeeze(0).cpu()
+
+        with prof.stage("infer.make_robot_action"):
+            rows: list[torch.Tensor] = []
+            for step in range(actions.shape[0]):
+                action_dict = make_robot_action(actions[step], self._dataset_features)
+                rows.append(torch.tensor([action_dict[k] for k in self._ordered_action_keys]))
+        return rows
+
+    def _autocast_ctx(self):
+        """AMP autocast on CUDA when the policy enables it; a no-op otherwise."""
+        if self._device.type == "cuda" and self._policy.config.use_amp:
+            return torch.autocast(device_type=self._device.type)
+        return nullcontext()

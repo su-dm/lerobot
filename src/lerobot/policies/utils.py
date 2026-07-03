@@ -99,6 +99,7 @@ def prepare_observation_for_inference(
     device: torch.device,
     task: str | None = None,
     robot_type: str | None = None,
+    image_resize_shapes: dict[str, tuple[int, ...]] | None = None,
 ) -> RobotObservation:
     """Converts observation data to model-ready PyTorch tensors.
 
@@ -106,9 +107,16 @@ def prepare_observation_for_inference(
     preprocessing, and prepares it for model inference. The steps include:
     1. Converting NumPy arrays to PyTorch tensors.
     2. Normalizing and permuting image data (if any).
-    3. Adding a batch dimension to each tensor.
-    4. Moving all tensors to the specified compute device.
-    5. Adding task and robot type information to the dictionary.
+    3. (Optionally) resizing image data to the policy's expected resolution.
+    4. Adding a batch dimension to each tensor.
+    5. Moving all tensors to the specified compute device.
+    6. Adding task and robot type information to the dictionary.
+
+    Images are uploaded to ``device`` as raw ``uint8`` *before* the float cast,
+    so the host->device copy is ~4x smaller than a ``float32`` copy and the
+    per-pixel cast / channel permute / contiguous repack run on the (typically
+    faster) accelerator instead of the CPU.  The numerical result is identical
+    to converting on the host first.
 
     Args:
         observation: A dictionary mapping observation names (str) to NumPy
@@ -117,19 +125,41 @@ def prepare_observation_for_inference(
             tensors will be moved.
         task: An optional string identifier for the current task.
         robot_type: An optional string identifier for the robot being used.
+        image_resize_shapes: Optional mapping from image observation key to the
+            policy's expected feature shape (C, H, W).  When provided and the
+            captured frame differs from the target (H, W), the image is resized
+            on-device with bilinear interpolation.  Lets a high-resolution
+            camera feed a lower-resolution policy while shrinking the upload.
 
     Returns:
         A dictionary where values are PyTorch tensors preprocessed for
         inference, residing on the target device. Image tensors are reshaped
         to (C, H, W) and normalized to a [0, 1] range.
     """
+    # ``non_blocking`` only has an effect for CUDA (and pinned host memory); it
+    # is a no-op elsewhere, mirroring ``DeviceProcessorStep``.
+    non_blocking = "cuda" in str(device)
     for name in observation:
-        observation[name] = torch.from_numpy(observation[name])
+        tensor = torch.from_numpy(observation[name])
         if "image" in name:
-            observation[name] = observation[name].type(torch.float32) / 255
-            observation[name] = observation[name].permute(2, 0, 1).contiguous()
-        observation[name] = observation[name].unsqueeze(0)
-        observation[name] = observation[name].to(device)
+            # Upload raw uint8 (H, W, C), then do the heavy per-pixel work on the
+            # device. ``permute`` is a free view; the float cast allocates the
+            # (larger) float buffer on-device rather than copying it over the bus.
+            tensor = tensor.to(device, non_blocking=non_blocking)
+            tensor = tensor.permute(2, 0, 1).to(dtype=torch.float32).div_(255.0)
+            if image_resize_shapes is not None and name in image_resize_shapes:
+                target = image_resize_shapes[name]
+                if tuple(tensor.shape[-2:]) != (int(target[-2]), int(target[-1])):
+                    tensor = nn.functional.interpolate(
+                        tensor.unsqueeze(0),
+                        size=(int(target[-2]), int(target[-1])),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+            tensor = tensor.contiguous().unsqueeze(0)
+        else:
+            tensor = tensor.unsqueeze(0).to(device, non_blocking=non_blocking)
+        observation[name] = tensor
 
     observation["task"] = task if task else ""
     observation["robot_type"] = robot_type if robot_type else ""
