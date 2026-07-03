@@ -428,6 +428,242 @@ def test_reset_clears_action_cache():
 
 
 # ---------------------------------------------------------------------------
+# Background chunk prefetch
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_requires_chunked_cache():
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+
+    policy = MagicMock()
+    policy.config = _make_act_policy_config()
+    with pytest.raises(ValueError, match="requires inference.chunked_action_cache"):
+        create_inference_engine(
+            SyncInferenceConfig(chunked_action_cache=False, prefetch_chunks=True),
+            policy=policy,
+            preprocessor=MagicMock(),
+            postprocessor=MagicMock(),
+            robot_wrapper=MagicMock(robot_type="mock"),
+            hw_features={},
+            dataset_features={},
+            ordered_action_keys=["k"],
+            task="test",
+            fps=30.0,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("watermark", [0, 50, 51])
+def test_prefetch_watermark_bounds(watermark):
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+
+    policy = MagicMock()
+    policy.config = _make_act_policy_config(n_action_steps=50)
+    with pytest.raises(ValueError, match="prefetch_watermark"):
+        create_inference_engine(
+            SyncInferenceConfig(
+                chunked_action_cache=True, prefetch_chunks=True, prefetch_watermark=watermark
+            ),
+            policy=policy,
+            preprocessor=MagicMock(),
+            postprocessor=MagicMock(),
+            robot_wrapper=MagicMock(robot_type="mock"),
+            hw_features={},
+            dataset_features={},
+            ordered_action_keys=["k"],
+            task="test",
+            fps=30.0,
+            device="cpu",
+        )
+
+
+def test_prefetch_factory_wiring():
+    from lerobot.rollout import SyncInferenceConfig, create_inference_engine
+
+    policy = MagicMock()
+    policy.config = _make_act_policy_config(n_action_steps=50)
+    engine = create_inference_engine(
+        SyncInferenceConfig(chunked_action_cache=True, prefetch_chunks=True, prefetch_watermark=10),
+        policy=policy,
+        preprocessor=MagicMock(),
+        postprocessor=MagicMock(),
+        robot_wrapper=MagicMock(robot_type="mock"),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=["k"],
+        task="test",
+        fps=30.0,
+        device="cpu",
+    )
+    assert engine._prefetch_watermark == 10
+    assert engine.inline_device_compute is False
+
+
+def _build_prefetch_engine(n_action_steps, action_dim, watermark, gate=None):
+    """Prefetch-mode engine with a stub policy.
+
+    The stub's chunk values encode the forward-pass count (call ``c`` yields
+    row ``t`` == ``[c*1000 + t*10 + i]``) so tests can verify which chunk and
+    which row an action came from.  When ``gate`` (a ``threading.Event``) is
+    given, the stub blocks on it, letting tests control worker timing.
+    """
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    call_count = {"n": 0}
+
+    def predict(_obs):
+        if gate is not None:
+            assert gate.wait(timeout=5.0), "test gate never opened"
+        call_count["n"] += 1
+        c = call_count["n"]
+        return torch.stack(
+            [torch.arange(action_dim, dtype=torch.float32) + c * 1000 + t * 10 for t in range(n_action_steps)]
+        ).unsqueeze(0)
+
+    policy = MagicMock()
+    policy.predict_action_chunk = MagicMock(side_effect=predict)
+
+    action_names = [f"a{i}" for i in range(action_dim)]
+    dataset_features = {ACTION: {"names": action_names, "dtype": "float32", "shape": (action_dim,)}}
+
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(side_effect=lambda x: x),
+        postprocessor=MagicMock(side_effect=lambda x: x),
+        dataset_features=dataset_features,
+        ordered_action_keys=action_names,
+        task="test",
+        device="cpu",
+        robot_type="mock",
+        chunk_action_steps=n_action_steps,
+        prefetch_watermark=watermark,
+    )
+    return engine, policy, call_count
+
+
+def _wait_for(predicate, timeout=5.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("timed out waiting for prefetch worker")
+
+
+def test_prefetch_first_chunk_serves_from_index_zero():
+    import numpy as np
+
+    engine, policy, _ = _build_prefetch_engine(n_action_steps=5, action_dim=2, watermark=2)
+    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
+    engine.start()
+    try:
+        # First tick: nothing cached, request submitted, no action yet.
+        assert engine.get_action(obs) is None
+        _wait_for(lambda: not engine._result_q.empty())
+        # Empty cache at snapshot -> skip 0 -> chunk 1 served from row 0.
+        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1000.0, 1001.0]))
+        assert policy.predict_action_chunk.call_count >= 1
+    finally:
+        engine.stop()
+
+
+def test_prefetch_skips_overlapping_actions_at_watermark():
+    import threading
+
+    import numpy as np
+
+    gate = threading.Event()
+    gate.set()  # first chunk computes immediately
+    engine, policy, calls = _build_prefetch_engine(n_action_steps=5, action_dim=2, watermark=2, gate=gate)
+    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
+    engine.start()
+    try:
+        assert engine.get_action(obs) is None
+        _wait_for(lambda: not engine._result_q.empty())
+
+        # Serve rows 0..2 of chunk 1; cache drops 5 -> 2.
+        for t in range(3):
+            torch.testing.assert_close(
+                engine.get_action(obs), torch.tensor([1000.0 + t * 10, 1001.0 + t * 10])
+            )
+
+        # Block the worker, then hit the watermark tick: cache len == 2 -> submit
+        # with skip=2 while rows 3 and 4 are still served from the old cache.
+        gate.clear()
+        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1030.0, 1031.0]))
+        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1040.0, 1041.0]))
+
+        # Worker still blocked: cache empty -> no action (robot holds pose).
+        assert engine.get_action(obs) is None
+
+        gate.set()
+        _wait_for(lambda: not engine._result_q.empty())
+        # Chunk 2 rows 0 and 1 cover ticks already served from chunk 1 -> skipped.
+        torch.testing.assert_close(engine.get_action(obs), torch.tensor([2020.0, 2021.0]))
+        assert calls["n"] == 2
+    finally:
+        engine.stop()
+
+
+def test_prefetch_reset_discards_inflight_chunk():
+    import threading
+
+    import numpy as np
+
+    gate = threading.Event()
+    engine, policy, calls = _build_prefetch_engine(n_action_steps=5, action_dim=2, watermark=2, gate=gate)
+    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
+    engine.start()
+    try:
+        assert engine.get_action(obs) is None  # submits request; worker blocked on gate
+        engine.reset()  # invalidates the in-flight generation
+        gate.set()
+        _wait_for(lambda: not engine._result_q.empty())
+        # Stale chunk 1 is discarded; this call re-submits with the new generation.
+        assert engine.get_action(obs) is None
+        _wait_for(lambda: not engine._result_q.empty())
+        # Fresh chunk (2nd forward) served from row 0.
+        torch.testing.assert_close(engine.get_action(obs), torch.tensor([2000.0, 2001.0]))
+        assert calls["n"] == 2
+    finally:
+        engine.stop()
+
+
+def test_prefetch_worker_error_propagates():
+    import numpy as np
+
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    policy = MagicMock()
+    policy.predict_action_chunk = MagicMock(side_effect=RuntimeError("boom"))
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(side_effect=lambda x: x),
+        postprocessor=MagicMock(side_effect=lambda x: x),
+        dataset_features={ACTION: {"names": ["a0"], "dtype": "float32", "shape": (1,)}},
+        ordered_action_keys=["a0"],
+        task="test",
+        device="cpu",
+        robot_type="mock",
+        chunk_action_steps=5,
+        prefetch_watermark=2,
+    )
+    obs = {"observation.state": np.zeros(1, dtype=np.float32)}
+    engine.start()
+    try:
+        assert engine.get_action(obs) is None
+        _wait_for(lambda: not engine._result_q.empty())
+        with pytest.raises(RuntimeError, match="prefetch worker failed"):
+            engine.get_action(obs)
+    finally:
+        engine.stop()
+
+
+# ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
 

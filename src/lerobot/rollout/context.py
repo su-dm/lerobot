@@ -217,13 +217,16 @@ def build_rollout_context(
     if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
         try:
             if hasattr(torch, "compile"):
-                compile_kwargs = {
-                    "backend": cfg.torch_compile_backend,
-                    "mode": cfg.torch_compile_mode,
-                    "options": {"triton.cudagraphs": False},
-                }
+                # torch.compile forbids passing ``mode`` and ``options`` together.
+                # Only disable cudagraphs (a Triton/CUDA-only option) when compiling
+                # with the default mode on CUDA; otherwise honor the requested mode.
+                compile_kwargs = {"backend": cfg.torch_compile_backend}
+                if cfg.torch_compile_mode and cfg.torch_compile_mode != "default":
+                    compile_kwargs["mode"] = cfg.torch_compile_mode
+                elif cfg.torch_compile_backend == "inductor" and torch.cuda.is_available():
+                    compile_kwargs["options"] = {"triton.cudagraphs": False}
                 policy.predict_action_chunk = torch.compile(policy.predict_action_chunk, **compile_kwargs)
-                logger.info("torch.compile applied to predict_action_chunk")
+                logger.info("torch.compile applied to predict_action_chunk (%s)", compile_kwargs)
         except Exception as e:
             logger.warning("Failed to apply torch.compile: %s", e)
 

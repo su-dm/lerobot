@@ -84,6 +84,17 @@ class InferenceEngine(abc.ABC):
         return True
 
     @property
+    def inline_device_compute(self) -> bool:
+        """True if ``get_action`` runs device compute on the calling thread.
+
+        Profiling uses this to decide whether to synchronize the device around
+        main-loop stages: syncing is required for correct attribution when
+        inference is inline, but would serialize the control loop against a
+        background inference thread when it is not.
+        """
+        return True
+
+    @property
     def failed(self) -> bool:
         """True if an unrecoverable error occurred in the backend."""
         return False

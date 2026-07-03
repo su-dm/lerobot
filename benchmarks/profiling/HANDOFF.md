@@ -131,43 +131,63 @@ Instrumentation added to `base.py`, `core.py`, `sync.py` (the `prof.stage(...)` 
   Confirmed by log-timestamp cadence (the warning has no rate-limiting, so one per
   3.3 s ⇒ one slow tick per 3.3 s).
 
-## 7. THE current open problem
+## 7. Background chunk prefetch (SHIPPED — was the open problem)
 
-The refill tick runs the **full ACT forward (~150 ms, up to ~770 ms during MPS
-kernel warmup) synchronously on the control loop**. So the arm runs smoothly for
-~3 s, then freezes ~0.2–0.8 s while the next chunk computes. A 150 ms forward
-cannot fit in a 33 ms tick, so caching alone can't fix this — the forward must move
-**off** the control loop.
+The refill tick used to run the **full ACT forward (~150 ms, up to ~770 ms during
+MPS kernel warmup) synchronously on the control loop**: smooth for ~3 s, then a
+0.2–0.8 s freeze. This is now fixed by an opt-in **background prefetch worker**
+in `SyncInferenceEngine` (`src/lerobot/rollout/inference/sync.py`):
 
-## 8. Recommended next steps (in priority order)
+- When the action cache drops to `prefetch_watermark` actions (default 20 ≈
+  0.66 s of runway at 30 fps), the current observation is snapshotted and the
+  next chunk is computed on a dedicated worker thread while the main loop keeps
+  serving cached actions. On cheap ticks the main thread does **zero MPS work**,
+  so there is no MPS contention with the background forward.
+- **Time alignment (important, easy to get wrong):** the first
+  `len(cache-at-snapshot)` actions of the prefetched chunk are **skipped**,
+  because those indices cover the ticks that were served from the old cache
+  while the forward ran. Serving them would replay ~0.66 s of already-executed
+  trajectory at every chunk boundary. With the skip, effective inference cadence
+  is every `n_action_steps - watermark` ticks (100−20 = 80 ticks ≈ 2.7 s).
+- If the worker is slower than the runway (e.g. MPS warmup on the very first
+  chunks), `get_action` returns `None` and the robot briefly holds pose — a
+  time-shift, same semantics as a vanilla inline stall, never a jump.
+- `reset()` bumps a generation counter so in-flight chunks computed from
+  pre-reset observations are discarded. Worker errors propagate to the control
+  thread on the next `get_action`.
+- Profiling note: `dispatch.get_action` / `loop.send_next_action` stages now
+  sync the device only when the engine reports `inline_device_compute` — with a
+  background inference thread (prefetch or RTC), a main-thread
+  `torch.mps.synchronize()` would serialize the loop against the background
+  forward and destroy both the measurement and the benefit.
 
-1. **Background chunk prefetch (the real fix — proposed, not yet built).** Add a
-   background thread to the chunked sync engine that prefetches the next chunk when
-   the cache drops below a watermark (e.g. 20 actions left ≈ 0.66 s of runway at
-   30 fps — plenty to hide a 150 ms forward), while the main loop keeps serving cached
-   actions. The threading pattern is already proven by `RTCInferenceEngine`
-   (`src/lerobot/rollout/inference/rtc.py`) — copy its lifecycle (start/stop/pause/
-   resume, obs holder + lock, error backoff). **Why not just use RTC?** RTC calls
-   `predict_action_chunk(inference_delay=..., prev_chunk_left_over=...)`, a signature
-   plain ACT doesn't implement. So this is a lighter "async chunk prefetch" without
-   RTC's reanchoring/latency logic. On cheap ticks the main thread does **zero MPS
-   work**, so there's no MPS contention with the background forward.
-   - Watch out for: MPS warmup on the very first forward(s) (pre-warm before the loop
-     starts); resetting the thread + cache on `engine.reset()`; what to return if the
-     cache momentarily empties (return `None` → loop reuses last action, or block
-     briefly). Add tests mirroring the existing chunked-cache tests.
+Run it (add to the repro command from §1):
+
+```bash
+--inference.chunked_action_cache=true --inference.prefetch_chunks=true \
+--inference.prefetch_watermark=20
+```
+
+Tests: `tests/test_rollout.py` (`test_prefetch_*`) cover factory validation,
+skip alignment at the watermark, reset/generation invalidation, and worker
+error propagation. **Not yet validated on the real robot** — do a live run and
+confirm the slow-loop warnings are gone entirely.
+
+## 8. Remaining next steps (in priority order)
+
+1. **Validate prefetch on hardware** (see §7). Expected: no slow-loop warnings,
+   no periodic freeze; possibly a short hold at episode start while the first
+   chunk (and MPS kernel warmup) computes in the background.
 2. **Resolution reduction + retrain.** The forward is ~146 ms @1080p vs ~25 ms
    @480×640 vs ~9.8 ms @256×256 — near-quadratic in the transformer. Combine
    `--inference.resize_observation_images=true` (already shipped) to shrink the input,
    but **retrain/fine-tune at the lower resolution** to avoid the train/test shift.
-   This is the highest-accuracy-preserving way to make the forward itself cheap enough
-   that even synchronous refills fit.
-3. **Fix the `torch.compile` bug** (early finding, **not yet fixed**). In
-   `src/lerobot/rollout/context.py` the compile kwargs pass both `mode` **and**
-   `options` (torch raises "Either mode or options can be specified…"), and
-   `triton.cudagraphs` is CUDA-only. Fix so `--use_torch_compile` works on MPS at all;
-   then measure whether inductor helps on MPS (historically immature — measure, don't
-   assume).
+   Prefetch makes 30 FPS achievable at 1080p; lower resolution is still the
+   highest-value accuracy/latency trade to pursue for headroom and robustness.
+3. **`torch.compile` kwargs bug — FIXED** in `src/lerobot/rollout/context.py`
+   (`mode` and `options` are mutually exclusive; `triton.cudagraphs` is now only
+   passed for inductor-on-CUDA). Whether inductor actually helps on MPS is
+   still unmeasured — measure before recommending `--use_torch_compile` there.
 4. **`channels_last` end-to-end** to remove the physical CHW transpose (the
    `contiguous`), letting ResNet consume NHWC directly. Low priority; measure.
 

@@ -292,7 +292,9 @@ def send_next_action(
     if interpolator.needs_new_action():
         with prof.stage("dispatch.build_dataset_frame"):
             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-        with prof.stage("dispatch.get_action", sync=True):
+        # Only force a device sync when inference is inline: syncing here with a
+        # background inference thread would stall the control loop on its kernels.
+        with prof.stage("dispatch.get_action", sync=engine.inline_device_compute):
             action_tensor = engine.get_action(obs_frame)
         if action_tensor is not None:
             interpolator.add(action_tensor.cpu())

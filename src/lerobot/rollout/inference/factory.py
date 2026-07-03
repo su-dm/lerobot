@@ -77,6 +77,19 @@ class SyncInferenceConfig(InferenceEngineConfig):
     # default; the factory raises for unsupported policies.
     chunked_action_cache: bool = False
 
+    # When True (requires chunked_action_cache), the next chunk is computed by
+    # a background thread once the cache drops to ``prefetch_watermark`` actions,
+    # instead of blocking the control loop when the cache empties. The first
+    # ``watermark`` actions of the prefetched chunk are skipped so it stays
+    # time-aligned with the actions served from the old cache in the meantime.
+    # This removes the periodic inference stall from the control loop entirely.
+    prefetch_chunks: bool = False
+
+    # Cache level (in actions) at which the background prefetch is triggered.
+    # Must be >= 1 and < the policy's n_action_steps. At 30 FPS the default of
+    # 20 gives ~0.66 s of runway to hide the forward pass.
+    prefetch_watermark: int = 20
+
 
 @InferenceEngineConfig.register_subclass("rtc")
 @dataclass
@@ -150,6 +163,19 @@ def create_inference_engine(
         chunk_action_steps = None
         if config.chunked_action_cache:
             chunk_action_steps = _resolve_chunk_action_steps(policy.config)
+        prefetch_watermark = None
+        if config.prefetch_chunks:
+            if chunk_action_steps is None:
+                raise ValueError(
+                    "inference.prefetch_chunks requires inference.chunked_action_cache=true "
+                    "(the prefetch worker produces whole chunks for the action cache)."
+                )
+            if not (1 <= config.prefetch_watermark < chunk_action_steps):
+                raise ValueError(
+                    f"inference.prefetch_watermark must be in [1, n_action_steps), got "
+                    f"{config.prefetch_watermark} with n_action_steps={chunk_action_steps}."
+                )
+            prefetch_watermark = config.prefetch_watermark
         return SyncInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
@@ -161,6 +187,7 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
             image_resize_shapes=image_resize_shapes,
             chunk_action_steps=chunk_action_steps,
+            prefetch_watermark=prefetch_watermark,
         )
     if isinstance(config, RTCInferenceConfig):
         return RTCInferenceEngine(

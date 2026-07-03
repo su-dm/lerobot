@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import logging
+import queue
 from collections import deque
 from contextlib import nullcontext
 from copy import copy
+from threading import Event, Thread
 
 import torch
 
@@ -32,6 +34,11 @@ from .base import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
+# Hard timeout for joining the prefetch worker on stop().
+_PREFETCH_JOIN_TIMEOUT_S: float = 5.0
+# Poll interval for the worker's request-queue wait (bounds shutdown latency).
+_PREFETCH_POLL_S: float = 0.1
+
 
 # NOTE: ``chunk_action_steps`` enables the "chunked action cache" fast path (see
 # ``_get_action_chunked``).  It is opt-in via ``SyncInferenceConfig`` and the
@@ -41,6 +48,17 @@ logger = logging.getLogger(__name__)
 # ensembling (the ensembler lives in ``select_action``), Diffusion-family
 # (obs-history queues populated as a side effect of ``select_action``), and
 # relative-action policies (the postprocessor reanchors per call).
+#
+# ``prefetch_watermark`` additionally moves the chunk computation off the
+# control thread: when the cache drops to the watermark, the observation is
+# snapshotted and the next chunk is computed by a background worker while the
+# main loop keeps serving cached actions.  Time alignment is preserved by
+# skipping the first ``len(cache-at-snapshot)`` actions of the new chunk: those
+# indices correspond to ticks that were (or will be) served from the old cache
+# before the new chunk starts, so serving them again would replay the past.
+# If the worker is slower than the remaining runway the cache empties and
+# ``get_action`` returns ``None`` (robot holds pose) until the chunk lands —
+# the same time-shift semantics as a vanilla inline stall, never a jump.
 
 
 class SyncInferenceEngine(InferenceEngine):
@@ -68,6 +86,7 @@ class SyncInferenceEngine(InferenceEngine):
         robot_type: str,
         image_resize_shapes: dict[str, tuple[int, ...]] | None = None,
         chunk_action_steps: int | None = None,
+        prefetch_watermark: int | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -79,23 +98,57 @@ class SyncInferenceEngine(InferenceEngine):
         self._robot_type = robot_type
         self._image_resize_shapes = image_resize_shapes
         self._chunk_action_steps = chunk_action_steps
+        self._prefetch_watermark = prefetch_watermark
         # Local cache of postprocessed, CPU-side, reordered action rows. Only
         # used when ``chunk_action_steps`` is set.
         self._action_cache: deque[torch.Tensor] = deque()
+        # Background prefetch state (only used when ``prefetch_watermark`` is set).
+        self._worker: Thread | None = None
+        self._worker_stop = Event()
+        # Single-slot request queue: at most one chunk computation in flight.
+        self._request_q: queue.Queue = queue.Queue(maxsize=1)
+        self._result_q: queue.Queue = queue.Queue()
+        self._inflight = False
+        # Bumped on reset() so results computed from pre-reset observations are discarded.
+        self._generation = 0
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d, resize_images=%s, chunk_steps=%s)",
+            "SyncInferenceEngine initialized (device=%s, action_keys=%d, resize_images=%s, "
+            "chunk_steps=%s, prefetch_watermark=%s)",
             self._device,
             len(ordered_action_keys),
             bool(image_resize_shapes),
             chunk_action_steps,
+            prefetch_watermark,
         )
 
+    @property
+    def inline_device_compute(self) -> bool:
+        """False when chunk computation runs on the background prefetch worker."""
+        return self._prefetch_watermark is None
+
     def start(self) -> None:
-        """No background resources to start."""
-        logger.info("SyncInferenceEngine started (inline mode — no background thread)")
+        """Start the prefetch worker (if enabled); otherwise nothing to do."""
+        if self._prefetch_watermark is None:
+            logger.info("SyncInferenceEngine started (inline mode — no background thread)")
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker_stop.clear()
+        self._worker = Thread(target=self._prefetch_loop, daemon=True, name="SyncChunkPrefetch")
+        self._worker.start()
+        logger.info(
+            "SyncInferenceEngine started (chunk prefetch worker running, watermark=%d)",
+            self._prefetch_watermark,
+        )
 
     def stop(self) -> None:
-        """No background resources to stop."""
+        """Stop the prefetch worker (if running)."""
+        if self._worker is not None:
+            self._worker_stop.set()
+            self._worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
+            if self._worker.is_alive():
+                logger.warning("Chunk prefetch worker did not join within %.1fs", _PREFETCH_JOIN_TIMEOUT_S)
+            self._worker = None
         logger.info("SyncInferenceEngine stopped")
 
     def reset(self) -> None:
@@ -105,10 +158,15 @@ class SyncInferenceEngine(InferenceEngine):
         self._preprocessor.reset()
         self._postprocessor.reset()
         self._action_cache.clear()
+        # Invalidate any in-flight prefetch: its observation predates the reset.
+        self._generation += 1
+        self._inflight = False
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Return the next action, reordered to match the dataset action keys."""
         if self._chunk_action_steps is not None:
+            if self._prefetch_watermark is not None:
+                return self._get_action_prefetch(obs_frame)
             return self._get_action_chunked(obs_frame)
         return self._get_action_single(obs_frame)
 
@@ -195,6 +253,75 @@ class SyncInferenceEngine(InferenceEngine):
                 action_dict = make_robot_action(actions[step], self._dataset_features)
                 rows.append(torch.tensor([action_dict[k] for k in self._ordered_action_keys]))
         return rows
+
+    # ------------------------------------------------------------------
+    # Background chunk prefetch
+    # ------------------------------------------------------------------
+
+    def _get_action_prefetch(self, obs_frame: dict | None) -> torch.Tensor | None:
+        """Serve cached actions while the next chunk is computed off-thread.
+
+        Per call: (1) fold in any finished chunk (dropping the first ``skip``
+        actions so the new chunk stays time-aligned with what the old cache
+        already served), (2) if the cache is at/below the watermark and nothing
+        is in flight, snapshot ``obs_frame`` and request the next chunk,
+        (3) pop one cached action, or ``None`` if the cache is empty (the
+        caller then sends nothing and the robot holds its last pose).
+        """
+        self._drain_prefetch_results()
+
+        if (
+            not self._inflight
+            and obs_frame is not None
+            and len(self._action_cache) <= self._prefetch_watermark
+        ):
+            # ``skip`` = actions still pending at snapshot time (including the
+            # one popped below this tick). The new chunk's indices [0, skip)
+            # cover the same ticks, so they must not be served again.
+            skip = len(self._action_cache)
+            try:
+                self._request_q.put_nowait((self._generation, skip, copy(obs_frame)))
+                self._inflight = True
+            except queue.Full:
+                # A stale (pre-reset) request is still queued; the worker will
+                # pick it up and its result will be discarded by generation.
+                pass
+
+        if not self._action_cache:
+            return None
+        return self._action_cache.popleft()
+
+    def _drain_prefetch_results(self) -> None:
+        """Fold finished prefetch results into the action cache (non-blocking)."""
+        while True:
+            try:
+                status, generation, payload = self._result_q.get_nowait()
+            except queue.Empty:
+                return
+            self._inflight = False
+            if generation != self._generation:
+                logger.debug("Discarding stale prefetched chunk (generation %d)", generation)
+                continue
+            if status == "error":
+                raise RuntimeError("Chunk prefetch worker failed during policy inference") from payload
+            skip, rows = payload
+            self._action_cache.extend(rows[skip:])
+
+    def _prefetch_loop(self) -> None:
+        """Background worker: compute one chunk per request."""
+        logger.info("Chunk prefetch worker started")
+        while not self._worker_stop.is_set():
+            try:
+                generation, skip, obs_frame = self._request_q.get(timeout=_PREFETCH_POLL_S)
+            except queue.Empty:
+                continue
+            try:
+                rows = self._run_policy_chunk(obs_frame)
+                self._result_q.put(("ok", generation, (skip, rows)))
+            except Exception as e:  # propagated to the control thread on next get_action
+                logger.error("Chunk prefetch worker error: %s", e)
+                self._result_q.put(("error", generation, e))
+        logger.info("Chunk prefetch worker exiting")
 
     def _autocast_ctx(self):
         """AMP autocast on CUDA when the policy enables it; a no-op otherwise."""

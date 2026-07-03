@@ -173,6 +173,11 @@ class RTCInferenceEngine(InferenceEngine):
         return self._rtc_error.is_set()
 
     @property
+    def inline_device_compute(self) -> bool:
+        """Inference runs on the RTC background thread, not the control thread."""
+        return False
+
+    @property
     def action_queue(self) -> ActionQueue | None:
         """The shared action queue between the RTC thread and the main loop."""
         return self._action_queue

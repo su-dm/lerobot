@@ -81,7 +81,7 @@ class BaseStrategy(RolloutStrategy):
             if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
 
-            with prof.stage("loop.send_next_action", sync=True):
+            with prof.stage("loop.send_next_action", sync=engine.inline_device_compute):
                 action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
             self._log_telemetry(obs_processed, action_dict, ctx.runtime)
 
