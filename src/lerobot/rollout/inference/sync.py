@@ -111,6 +111,13 @@ class SyncInferenceEngine(InferenceEngine):
         self._inflight = False
         # Bumped on reset() so results computed from pre-reset observations are discarded.
         self._generation = 0
+        # Chunk-seam diagnostics (prefetch mode): pops remaining until the next
+        # served action comes from a new chunk, the last served action, and the
+        # accumulated within-chunk step deltas for comparison.
+        self._seam_countdown: int | None = None
+        self._last_action: torch.Tensor | None = None
+        self._within_chunk_delta_sum = 0.0
+        self._within_chunk_delta_count = 0
         logger.info(
             "SyncInferenceEngine initialized (device=%s, action_keys=%d, resize_images=%s, "
             "chunk_steps=%s, prefetch_watermark=%s)",
@@ -161,6 +168,10 @@ class SyncInferenceEngine(InferenceEngine):
         # Invalidate any in-flight prefetch: its observation predates the reset.
         self._generation += 1
         self._inflight = False
+        self._seam_countdown = None
+        self._last_action = None
+        self._within_chunk_delta_sum = 0.0
+        self._within_chunk_delta_count = 0
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Return the next action, reordered to match the dataset action keys."""
@@ -219,9 +230,13 @@ class SyncInferenceEngine(InferenceEngine):
             if obs_frame is None:
                 return None
             self._action_cache.extend(self._run_policy_chunk(obs_frame))
+            # The very next pop is the first action of the fresh chunk.
+            self._seam_countdown = 0
         if not self._action_cache:
             return None
-        return self._action_cache.popleft()
+        action = self._action_cache.popleft()
+        self._track_seam(action, obs_frame)
+        return action
 
     def _run_policy_chunk(self, obs_frame: dict) -> list[torch.Tensor]:
         """Run the policy once and return a list of postprocessed, reordered action rows."""
@@ -289,7 +304,55 @@ class SyncInferenceEngine(InferenceEngine):
 
         if not self._action_cache:
             return None
-        return self._action_cache.popleft()
+        action = self._action_cache.popleft()
+        self._track_seam(action, obs_frame)
+        return action
+
+    def _track_seam(self, action: torch.Tensor, obs_frame: dict | None) -> None:
+        """Log the action discontinuity at chunk boundaries vs within-chunk steps.
+
+        A seam jump much larger than the within-chunk mean indicates consecutive
+        chunks disagree (an open-loop chunking artifact or a prefetch alignment
+        bug); comparable magnitudes mean the seams are smooth and any jerkiness
+        comes from elsewhere (model quality, hardware, control timing).
+
+        The measured joint state disambiguates the two: if the previous chunk's
+        last command drifted far from the measured position and the new chunk
+        starts close to it, the seam is the policy *correcting* open-loop drift
+        (a chunking property, not a timing bug).
+        """
+        if self._last_action is not None:
+            deltas = (action - self._last_action).abs()
+            delta = deltas.max().item()
+            if self._seam_countdown == 0:
+                within_mean = self._within_chunk_delta_sum / max(self._within_chunk_delta_count, 1)
+                joint = self._ordered_action_keys[int(deltas.argmax())]
+                new_vs_state = old_vs_state = float("nan")
+                state = obs_frame.get("observation.state") if obs_frame is not None else None
+                if state is not None and len(state) == len(action):
+                    state_t = torch.as_tensor(state, dtype=action.dtype)
+                    idx = int(deltas.argmax())
+                    new_vs_state = (action[idx] - state_t[idx]).item()
+                    old_vs_state = (self._last_action[idx] - state_t[idx]).item()
+                logger.info(
+                    "Chunk seam |Δcmd|max=%.3f on %s | new cmd - measured=%+.3f | old cmd - measured=%+.3f "
+                    "(within-chunk mean |Δ|max=%.3f over %d steps)",
+                    delta,
+                    joint,
+                    new_vs_state,
+                    old_vs_state,
+                    within_mean,
+                    self._within_chunk_delta_count,
+                )
+                get_profiler().record("diag.seam_jump", delta / 1e3)  # stored so report shows raw units
+                self._within_chunk_delta_sum = 0.0
+                self._within_chunk_delta_count = 0
+            else:
+                self._within_chunk_delta_sum += delta
+                self._within_chunk_delta_count += 1
+        if self._seam_countdown is not None and self._seam_countdown >= 0:
+            self._seam_countdown -= 1
+        self._last_action = action
 
     def _drain_prefetch_results(self) -> None:
         """Fold finished prefetch results into the action cache (non-blocking)."""
@@ -305,6 +368,9 @@ class SyncInferenceEngine(InferenceEngine):
             if status == "error":
                 raise RuntimeError("Chunk prefetch worker failed during policy inference") from payload
             skip, rows = payload
+            # After the actions still in the cache are served, the next pop is
+            # the first action of this new chunk — that pop is the seam.
+            self._seam_countdown = len(self._action_cache)
             self._action_cache.extend(rows[skip:])
 
     def _prefetch_loop(self) -> None:

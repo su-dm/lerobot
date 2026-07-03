@@ -170,14 +170,40 @@ Run it (add to the repro command from §1):
 
 Tests: `tests/test_rollout.py` (`test_prefetch_*`) cover factory validation,
 skip alignment at the watermark, reset/generation invalidation, and worker
-error propagation. **Not yet validated on the real robot** — do a live run and
-confirm the slow-loop warnings are gone entirely.
+error propagation.
+
+**Validated on hardware (2026-07-03,** `rollout_20260703_115358.json` **+**
+`rollout_20260703_seamdiag2.json`**):** control loop went from mean 18.7 ms /
+p99 131 ms / max 1198 ms per tick (baseline) to mean 2.0 ms / p95 2.7 ms /
+max 76 ms. The 14 forwards (~180 ms each) all ran on the worker thread.
+A handful of isolated late ticks remain (~1 per chunk, up to ~75 ms, GIL
+contention while the worker dispatches kernels) — visible as occasional
+"running slower" warnings at 20–29 Hz, versus continuous 1–5 Hz before.
+
+**Chunk-seam diagnostic (also shipped, prefetch mode):** the engine now logs,
+at every chunk boundary, the command discontinuity vs the within-chunk mean and
+vs the measured joint state (`Chunk seam |Δcmd|max=… on <joint> | new cmd -
+measured=… | old cmd - measured=…`), and records `diag.seam_jump` (raw action
+units) in the profile. Live measurement: within-chunk steps are ~0.7–1.2
+units, but every seam jumps **~12–45 units on `shoulder_lift.pos`**, with the
+new chunk starting ~+18 above the measured position while the old chunk ended
+~−6 below it. The same jump appears at the very first (skip=0, vanilla-
+semantics) boundary, so it is **not** a prefetch-alignment artifact — the
+policy's consecutive chunks genuinely disagree. This open-loop chunk
+disagreement (present in the pre-optimization code too, masked by the freezes)
+is now the dominant smoothness problem, i.e. a model/chunking issue, not a
+control-loop timing issue.
 
 ## 8. Remaining next steps (in priority order)
 
-1. **Validate prefetch on hardware** (see §7). Expected: no slow-loop warnings,
-   no periodic freeze; possibly a short hold at episode start while the first
-   chunk (and MPS kernel warmup) computes in the background.
+1. **Attack the chunk-seam disagreement (model side).** Cheap experiment first:
+   `--policy.n_action_steps=25 --inference.prefetch_watermark=10` re-plans 4×
+   more often (forward every 0.5 s — trivial for the background worker), which
+   bounds open-loop drift per chunk. Then inspect in Rerun
+   (`--display_data=true`): commanded vs measured `shoulder_lift.pos` will show
+   a sawtooth if the disagreement persists. The principled fix is ACT temporal
+   ensembling, which needs a forward every tick — infeasible at 1080p (~150 ms)
+   but fine at 256×256 (~10 ms) → pair with the resolution retrain below.
 2. **Resolution reduction + retrain.** The forward is ~146 ms @1080p vs ~25 ms
    @480×640 vs ~9.8 ms @256×256 — near-quadratic in the transformer. Combine
    `--inference.resize_observation_images=true` (already shipped) to shrink the input,
