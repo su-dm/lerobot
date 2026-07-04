@@ -1,0 +1,820 @@
+From 799a5bc37ecea267a4b7af3bdb4a9cc4f6071e4c Mon Sep 17 00:00:00 2001
+From: sudm <sudm711@gmail.com>
+Date: Fri, 3 Jul 2026 16:43:04 -0400
+Subject: [PATCH] feat(rollout): chunked action cache with background chunk
+ prefetch for sync inference
+
+The sync engine paid the per-tick observation upload + normalization on
+every control tick even though ACT consumes the observation only once per
+n_action_steps, and the tick that ran the forward pass blocked the control
+loop for the full inference latency (a periodic stall of hundreds of ms on
+slower accelerators, e.g. ACT at 1080p on Apple MPS).
+
+Two opt-in flags on --inference.type=sync remove both costs:
+
+- chunked_action_cache: drive the policy via predict_action_chunk and serve
+  postprocessed actions from a local FIFO, so preprocessing runs once per
+  chunk instead of every tick. Validated as behaviour-preserving only for
+  ACT without temporal ensembling; the factory raises for other policies.
+- prefetch_chunks: compute the next chunk on a background worker once the
+  cache drops to prefetch_watermark actions, while the loop keeps serving
+  cached actions. The first len(cache-at-snapshot) actions of the new chunk
+  are skipped so it stays time-aligned with the ticks served in the
+  meantime; if the worker outlasts the runway the engine returns None and
+  the robot holds pose (time-shift, same semantics as an inline stall).
+  reset() bumps a generation counter so in-flight chunks computed from
+  pre-reset observations are discarded, and worker errors propagate to the
+  control thread on the next get_action.
+
+Measured on an M1 MacBook driving an SO-101 at 30 FPS with ACT
+(chunk_size=100) on a 1920x1080 camera: control-loop compute went from
+18.7 ms mean / 1198 ms max per tick to 2.0 ms mean / 76 ms max, with all
+forward passes (~180 ms) off the control thread.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ docs/source/inference.mdx                |  29 ++
+ src/lerobot/rollout/inference/factory.py |  67 +++++
+ src/lerobot/rollout/inference/sync.py    | 221 +++++++++++++--
+ tests/test_rollout.py                    | 331 +++++++++++++++++++++++
+ 4 files changed, 630 insertions(+), 18 deletions(-)
+
+diff --git a/docs/source/inference.mdx b/docs/source/inference.mdx
+index 31405b5d..552313b7 100644
+--- a/docs/source/inference.mdx
++++ b/docs/source/inference.mdx
+@@ -207,6 +207,35 @@ One policy call per control tick. The main loop blocks until the action is compu
+
+ Works with all policies. No extra flags needed.
+
++#### Chunked action cache with background prefetch (ACT)
++
++For ACT, `select_action` only runs the expensive forward pass once every `n_action_steps` ticks — the other ticks pop an action from an internal queue and ignore the observation. The default sync path still pays the per-tick observation upload + normalization, and the tick that does run the forward pass blocks the control loop (a periodic stall of the full inference latency).
++
++Two opt-in flags remove both costs:
++
++- `--inference.chunked_action_cache=true` drives the policy via `predict_action_chunk` and serves postprocessed actions from a local cache, so observation preprocessing only runs when a new chunk is needed.
++- `--inference.prefetch_chunks=true` additionally computes the next chunk on a background thread: when the cache drops to `--inference.prefetch_watermark` actions (default 20), the current observation is snapshotted and the next chunk is prefetched while the loop keeps serving cached actions. The first `watermark` actions of the new chunk are skipped so it stays time-aligned with the actions served in the meantime. The control loop never blocks on inference.
++
++```bash
++lerobot-rollout \
++    --strategy.type=base \
++    --policy.path=${HF_USER}/act_policy \
++    --robot.type=so100_follower \
++    --robot.port=/dev/ttyACM0 \
++    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
++    --task="Pick up the cube" \
++    --inference.chunked_action_cache=true \
++    --inference.prefetch_chunks=true
++```
++
++| Flag                               | Description                                                                   | Default |
++| ---------------------------------- | ----------------------------------------------------------------------------- | ------- |
++| `--inference.chunked_action_cache` | Cache postprocessed action chunks; skip per-tick observation prep             | false   |
++| `--inference.prefetch_chunks`      | Compute the next chunk on a background thread (requires the cache)            | false   |
++| `--inference.prefetch_watermark`   | Cache level (in actions) that triggers the prefetch; `1 ≤ w < n_action_steps` | 20      |
++
++Currently supported for ACT without temporal ensembling, where serving cached chunks is behaviour-preserving (`select_action` ignores the observation while its queue is non-empty). The factory raises a clear error for unsupported policies. Each prefetched chunk yields `n_action_steps - watermark` usable actions, so the policy re-plans slightly more often than with the inline path.
++
+ ### Real-Time Chunking (`--inference.type=rtc`)
+
+ A background thread produces action chunks asynchronously. The main control loop polls for the next ready action while the policy computes the next chunk in parallel.
+diff --git a/src/lerobot/rollout/inference/factory.py b/src/lerobot/rollout/inference/factory.py
+index e600bed6..4347622d 100644
+--- a/src/lerobot/rollout/inference/factory.py
++++ b/src/lerobot/rollout/inference/factory.py
+@@ -62,6 +62,27 @@ class InferenceEngineConfig(draccus.ChoiceRegistry, abc.ABC):
+ class SyncInferenceConfig(InferenceEngineConfig):
+     """Inline synchronous inference (one policy call per control tick)."""
+
++    # When True, postprocessed action chunks are cached locally and served one
++    # per tick, so the policy (and the per-tick observation upload + normalize)
++    # only runs when the cache is empty.  Currently supported only for ACT
++    # policies without temporal ensembling, where it is behaviour-preserving.
++    # Disabled by default; the factory raises for unsupported policies.
++    chunked_action_cache: bool = False
++
++    # When True (requires chunked_action_cache), the next chunk is computed by
++    # a background thread once the cache drops to ``prefetch_watermark``
++    # actions, instead of blocking the control loop when the cache empties.
++    # The first ``watermark`` actions of the prefetched chunk are skipped so it
++    # stays time-aligned with the actions served from the old cache in the
++    # meantime.  This removes the periodic inference stall from the control
++    # loop entirely.
++    prefetch_chunks: bool = False
++
++    # Cache level (in actions) at which the background prefetch is triggered.
++    # Must be >= 1 and < the policy's n_action_steps.  At 30 FPS the default of
++    # 20 gives ~0.66 s of runway to hide the forward pass.
++    prefetch_watermark: int = 20
++
+
+ @InferenceEngineConfig.register_subclass("rtc")
+ @dataclass
+@@ -79,6 +100,34 @@ class RTCInferenceConfig(InferenceEngineConfig):
+ # ---------------------------------------------------------------------------
+
+
++def _resolve_chunk_action_steps(policy_config) -> int:
++    """Validate the policy and return how many chunk actions to cache per query.
++
++    The chunked-action cache bypasses ``select_action``, so it is only enabled
++    for policies where serving a cached chunk is behaviour-preserving.  Today
++    that is ACT without temporal ensembling: ``select_action`` ignores the
++    observation while its internal queue is non-empty, and the postprocessor is
++    a stateless per-action transform.  Anything else raises a clear error.
++    """
++    policy_type = getattr(policy_config, "type", None)
++    if policy_type != "act":
++        raise ValueError(
++            f"chunked_action_cache currently supports only ACT policies, got '{policy_type}'. "
++            "Disable inference.chunked_action_cache for this policy."
++        )
++    if getattr(policy_config, "temporal_ensemble_coeff", None) is not None:
++        raise ValueError(
++            "chunked_action_cache is incompatible with ACT temporal ensembling: the ensembler "
++            "requires a fresh forward pass every step. Disable one of the two."
++        )
++    n_action_steps = getattr(policy_config, "n_action_steps", None)
++    if not isinstance(n_action_steps, int) or n_action_steps < 1:
++        raise ValueError(
++            f"chunked_action_cache requires a positive integer n_action_steps, got {n_action_steps!r}."
++        )
++    return n_action_steps
++
++
+ def create_inference_engine(
+     config: InferenceEngineConfig,
+     *,
+@@ -99,6 +148,22 @@ def create_inference_engine(
+     """Instantiate the appropriate inference engine from a config object."""
+     logger.info("Creating inference engine: %s", config.type)
+     if isinstance(config, SyncInferenceConfig):
++        chunk_action_steps = None
++        if config.chunked_action_cache:
++            chunk_action_steps = _resolve_chunk_action_steps(policy.config)
++        prefetch_watermark = None
++        if config.prefetch_chunks:
++            if chunk_action_steps is None:
++                raise ValueError(
++                    "inference.prefetch_chunks requires inference.chunked_action_cache=true "
++                    "(the prefetch worker produces whole chunks for the action cache)."
++                )
++            if not (1 <= config.prefetch_watermark < chunk_action_steps):
++                raise ValueError(
++                    f"inference.prefetch_watermark must be in [1, n_action_steps), got "
++                    f"{config.prefetch_watermark} with n_action_steps={chunk_action_steps}."
++                )
++            prefetch_watermark = config.prefetch_watermark
+         return SyncInferenceEngine(
+             policy=policy,
+             preprocessor=preprocessor,
+@@ -108,6 +173,8 @@ def create_inference_engine(
+             task=task,
+             device=device,
+             robot_type=robot_wrapper.robot_type,
++            chunk_action_steps=chunk_action_steps,
++            prefetch_watermark=prefetch_watermark,
+         )
+     if isinstance(config, RTCInferenceConfig):
+         return RTCInferenceEngine(
+diff --git a/src/lerobot/rollout/inference/sync.py b/src/lerobot/rollout/inference/sync.py
+index 2bb05b6a..bc5d6d3e 100644
+--- a/src/lerobot/rollout/inference/sync.py
++++ b/src/lerobot/rollout/inference/sync.py
+@@ -17,8 +17,11 @@
+ from __future__ import annotations
+
+ import logging
++import queue
++from collections import deque
+ from contextlib import nullcontext
+ from copy import copy
++from threading import Event, Thread
+
+ import torch
+
+@@ -30,20 +33,27 @@ from .base import InferenceEngine
+
+ logger = logging.getLogger(__name__)
+
++# Hard timeout for joining the prefetch worker on stop().
++_PREFETCH_JOIN_TIMEOUT_S: float = 5.0
++# Poll interval for the worker's request-queue wait (bounds shutdown latency).
++_PREFETCH_POLL_S: float = 0.1
+
++
++# NOTE: ``chunk_action_steps`` enables the "chunked action cache" fast path
++# (see ``_get_action_chunked``).  It is opt-in via ``SyncInferenceConfig`` and
++# the factory only enables it for policies where it is provably
++# behaviour-preserving (currently ACT without temporal ensembling).  It
++# bypasses ``select_action`` — which is unsafe for SAC
++# (``predict_action_chunk`` raises), ACT temporal ensembling (the ensembler
++# lives in ``select_action``), and Diffusion-family policies (obs-history
++# queues are populated as a side effect of ``select_action``).
++#
+ # TODO(Steven): support relative-action policies.  The per-tick flow refreshes
+ # ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
+ # actions popped on later ticks get reanchored to the *current* robot state and
+ # absolute targets drift through the chunk.  Relative-action policies are
+ # rejected at context-build time today; RTC postprocesses the whole chunk and
+ # is unaffected.
+-#
+-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
+-# local FIFO of postprocessed actions.  Eliminates drift by construction and
+-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
+-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
+-# ``select_action``), and Diffusion-family (obs-history queues populated as a
+-# side effect of ``select_action``).
+
+
+ class SyncInferenceEngine(InferenceEngine):
+@@ -52,6 +62,24 @@ class SyncInferenceEngine(InferenceEngine):
+     ``get_action`` runs the full policy pipeline (pre/post-processor +
+     ``select_action``) on the given observation frame and returns a
+     CPU action tensor reordered to match the dataset action keys.
++
++    When ``chunk_action_steps`` is set, ``get_action`` instead serves actions
++    from a locally cached chunk (see :meth:`_get_action_chunked`): the policy
++    is queried via ``predict_action_chunk`` only when the cache is empty, so
++    the per-tick observation upload + normalization is skipped while cached
++    actions remain.
++
++    When ``prefetch_watermark`` is additionally set, the chunk computation
++    moves off the control thread entirely (see :meth:`_get_action_prefetch`):
++    once the cache drops to the watermark, the observation is snapshotted and
++    the next chunk is computed by a background worker while the control loop
++    keeps serving cached actions.  Time alignment is preserved by skipping the
++    first ``len(cache-at-snapshot)`` actions of the new chunk: those indices
++    correspond to ticks that are served from the old cache before the new
++    chunk starts, so serving them again would replay the past.  If the worker
++    is slower than the remaining runway the cache empties and ``get_action``
++    returns ``None`` (the robot holds its last pose) until the chunk lands —
++    the same time-shift semantics as an inline stall, never a jump.
+     """
+
+     def __init__(
+@@ -64,6 +92,8 @@ class SyncInferenceEngine(InferenceEngine):
+         task: str,
+         device: str | None,
+         robot_type: str,
++        chunk_action_steps: int | None = None,
++        prefetch_watermark: int | None = None,
+     ) -> None:
+         self._policy = policy
+         self._preprocessor = preprocessor
+@@ -73,18 +103,52 @@ class SyncInferenceEngine(InferenceEngine):
+         self._task = task
+         self._device = torch.device(device or "cpu")
+         self._robot_type = robot_type
++        self._chunk_action_steps = chunk_action_steps
++        self._prefetch_watermark = prefetch_watermark
++        # Local cache of postprocessed, CPU-side, reordered action rows.  Only
++        # used when ``chunk_action_steps`` is set.
++        self._action_cache: deque[torch.Tensor] = deque()
++        # Background prefetch state (only used when ``prefetch_watermark`` is set).
++        self._worker: Thread | None = None
++        self._worker_stop = Event()
++        # Single-slot request queue: at most one chunk computation in flight.
++        self._request_q: queue.Queue = queue.Queue(maxsize=1)
++        self._result_q: queue.Queue = queue.Queue()
++        self._inflight = False
++        # Bumped on reset() so results computed from pre-reset observations are discarded.
++        self._generation = 0
+         logger.info(
+-            "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
++            "SyncInferenceEngine initialized (device=%s, action_keys=%d, chunk_steps=%s, "
++            "prefetch_watermark=%s)",
+             self._device,
+             len(ordered_action_keys),
++            chunk_action_steps,
++            prefetch_watermark,
+         )
+
+     def start(self) -> None:
+-        """No background resources to start."""
+-        logger.info("SyncInferenceEngine started (inline mode — no background thread)")
++        """Start the prefetch worker (if enabled); otherwise nothing to do."""
++        if self._prefetch_watermark is None:
++            logger.info("SyncInferenceEngine started (inline mode — no background thread)")
++            return
++        if self._worker is not None and self._worker.is_alive():
++            return
++        self._worker_stop.clear()
++        self._worker = Thread(target=self._prefetch_loop, daemon=True, name="SyncChunkPrefetch")
++        self._worker.start()
++        logger.info(
++            "SyncInferenceEngine started (chunk prefetch worker running, watermark=%d)",
++            self._prefetch_watermark,
++        )
+
+     def stop(self) -> None:
+-        """No background resources to stop."""
++        """Stop the prefetch worker (if running)."""
++        if self._worker is not None:
++            self._worker_stop.set()
++            self._worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
++            if self._worker.is_alive():
++                logger.warning("Chunk prefetch worker did not join within %.1fs", _PREFETCH_JOIN_TIMEOUT_S)
++            self._worker = None
+         logger.info("SyncInferenceEngine stopped")
+
+     def reset(self) -> None:
+@@ -93,21 +157,28 @@ class SyncInferenceEngine(InferenceEngine):
+         self._policy.reset()
+         self._preprocessor.reset()
+         self._postprocessor.reset()
++        self._action_cache.clear()
++        # Invalidate any in-flight prefetch: its observation predates the reset.
++        self._generation += 1
++        self._inflight = False
+
+     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
+-        """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
++        """Return the next action, reordered to match the dataset action keys."""
++        if self._chunk_action_steps is not None:
++            if self._prefetch_watermark is not None:
++                return self._get_action_prefetch(obs_frame)
++            return self._get_action_chunked(obs_frame)
++        return self._get_action_single(obs_frame)
++
++    def _get_action_single(self, obs_frame: dict | None) -> torch.Tensor | None:
++        """Run the full inference pipeline on ``obs_frame`` and return one action."""
+         if obs_frame is None:
+             return None
+         # Shallow copy is intentional: the caller (`send_next_action`) builds
+         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
+         # tensor/array values are not shared with any other reader.
+         observation = copy(obs_frame)
+-        autocast_ctx = (
+-            torch.autocast(device_type=self._device.type)
+-            if self._device.type == "cuda" and self._policy.config.use_amp
+-            else nullcontext()
+-        )
+-        with torch.inference_mode(), autocast_ctx:
++        with torch.inference_mode(), self._autocast_ctx():
+             observation = prepare_observation_for_inference(
+                 observation, self._device, self._task, self._robot_type
+             )
+@@ -120,3 +191,117 @@ class SyncInferenceEngine(InferenceEngine):
+         # the returned tensor uniformly across backends.
+         action_dict = make_robot_action(action_tensor, self._dataset_features)
+         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])
++
++    def _get_action_chunked(self, obs_frame: dict | None) -> torch.Tensor | None:
++        """Serve the next action from the local chunk cache, refilling when empty.
++
++        This mirrors ACT's internal ``_action_queue`` semantics
++        (``predict_action_chunk`` sliced to ``n_action_steps``) but caches the
++        *postprocessed* actions here.  On ticks served from the cache, the
++        expensive observation upload + normalization is skipped entirely.
++        This is behaviour-preserving for policies whose ``select_action``
++        ignores the observation while its internal queue is non-empty
++        (validated for ACT without temporal ensembling in the factory).
++        """
++        if not self._action_cache:
++            if obs_frame is None:
++                return None
++            self._action_cache.extend(self._run_policy_chunk(obs_frame))
++        if not self._action_cache:
++            return None
++        return self._action_cache.popleft()
++
++    def _run_policy_chunk(self, obs_frame: dict) -> list[torch.Tensor]:
++        """Run the policy once and return a list of postprocessed, reordered action rows."""
++        observation = copy(obs_frame)
++        with torch.inference_mode(), self._autocast_ctx():
++            observation = prepare_observation_for_inference(
++                observation, self._device, self._task, self._robot_type
++            )
++            observation = self._preprocessor(observation)
++            actions = self._policy.predict_action_chunk(observation)
++            actions = actions[:, : self._chunk_action_steps]
++            actions = self._postprocessor(actions)
++        # (B=1, T, A) -> (T, A) on CPU.
++        actions = actions.squeeze(0).cpu()
++
++        rows: list[torch.Tensor] = []
++        for step in range(actions.shape[0]):
++            action_dict = make_robot_action(actions[step], self._dataset_features)
++            rows.append(torch.tensor([action_dict[k] for k in self._ordered_action_keys]))
++        return rows
++
++    # ------------------------------------------------------------------
++    # Background chunk prefetch
++    # ------------------------------------------------------------------
++
++    def _get_action_prefetch(self, obs_frame: dict | None) -> torch.Tensor | None:
++        """Serve cached actions while the next chunk is computed off-thread.
++
++        Per call: (1) fold in any finished chunk (dropping the first ``skip``
++        actions so the new chunk stays time-aligned with what the old cache
++        already served), (2) if the cache is at/below the watermark and nothing
++        is in flight, snapshot ``obs_frame`` and request the next chunk,
++        (3) pop one cached action, or ``None`` if the cache is empty (the
++        caller then sends nothing and the robot holds its last pose).
++        """
++        self._drain_prefetch_results()
++
++        if (
++            not self._inflight
++            and obs_frame is not None
++            and len(self._action_cache) <= self._prefetch_watermark
++        ):
++            # ``skip`` = actions still pending at snapshot time (including the
++            # one popped below this tick).  The new chunk's indices [0, skip)
++            # cover the same ticks, so they must not be served again.
++            skip = len(self._action_cache)
++            try:
++                self._request_q.put_nowait((self._generation, skip, copy(obs_frame)))
++                self._inflight = True
++            except queue.Full:
++                # A stale (pre-reset) request is still queued; the worker will
++                # pick it up and its result will be discarded by generation.
++                pass
++
++        if not self._action_cache:
++            return None
++        return self._action_cache.popleft()
++
++    def _drain_prefetch_results(self) -> None:
++        """Fold finished prefetch results into the action cache (non-blocking)."""
++        while True:
++            try:
++                status, generation, payload = self._result_q.get_nowait()
++            except queue.Empty:
++                return
++            self._inflight = False
++            if generation != self._generation:
++                logger.debug("Discarding stale prefetched chunk (generation %d)", generation)
++                continue
++            if status == "error":
++                raise RuntimeError("Chunk prefetch worker failed during policy inference") from payload
++            skip, rows = payload
++            self._action_cache.extend(rows[skip:])
++
++    def _prefetch_loop(self) -> None:
++        """Background worker: compute one chunk per request."""
++        logger.info("Chunk prefetch worker started")
++        while not self._worker_stop.is_set():
++            try:
++                generation, skip, obs_frame = self._request_q.get(timeout=_PREFETCH_POLL_S)
++            except queue.Empty:
++                continue
++            try:
++                rows = self._run_policy_chunk(obs_frame)
++                self._result_q.put(("ok", generation, (skip, rows)))
++            except Exception as e:  # propagated to the control thread on next get_action
++                logger.error("Chunk prefetch worker error: %s", e)
++                self._result_q.put(("error", generation, e))
++        logger.info("Chunk prefetch worker exiting")
++
++    def _autocast_ctx(self):
++        """AMP autocast on CUDA when the policy enables it; a no-op otherwise."""
++        if self._device.type == "cuda" and self._policy.config.use_amp:
++            return torch.autocast(device_type=self._device.type)
++        return nullcontext()
+diff --git a/tests/test_rollout.py b/tests/test_rollout.py
+index 85a29ff4..1b831c66 100644
+--- a/tests/test_rollout.py
++++ b/tests/test_rollout.py
+@@ -251,6 +251,337 @@ def test_create_inference_engine_sync():
+     assert isinstance(engine, SyncInferenceEngine)
+
+
++# ---------------------------------------------------------------------------
++# Chunked action cache
++# ---------------------------------------------------------------------------
++
++
++def _make_act_policy_config(n_action_steps=50, temporal_ensemble_coeff=None):
++    cfg = MagicMock()
++    cfg.type = "act"
++    cfg.n_action_steps = n_action_steps
++    cfg.temporal_ensemble_coeff = temporal_ensemble_coeff
++    return cfg
++
++
++def _make_engine_from_config(inference_config, policy_config):
++    from lerobot.rollout import create_inference_engine
++
++    policy = MagicMock()
++    policy.config = policy_config
++    return create_inference_engine(
++        inference_config,
++        policy=policy,
++        preprocessor=MagicMock(),
++        postprocessor=MagicMock(),
++        robot_wrapper=MagicMock(robot_type="mock"),
++        hw_features={},
++        dataset_features={},
++        ordered_action_keys=["k"],
++        task="test",
++        fps=30.0,
++        device="cpu",
++    )
++
++
++def test_chunked_cache_disabled_by_default():
++    from lerobot.rollout import SyncInferenceConfig
++
++    engine = _make_engine_from_config(SyncInferenceConfig(), _make_act_policy_config())
++    assert engine._chunk_action_steps is None
++
++
++def test_chunked_cache_resolves_n_action_steps_for_act():
++    from lerobot.rollout import SyncInferenceConfig
++
++    engine = _make_engine_from_config(
++        SyncInferenceConfig(chunked_action_cache=True), _make_act_policy_config(n_action_steps=42)
++    )
++    assert engine._chunk_action_steps == 42
++
++
++def test_chunked_cache_rejects_non_act_policy():
++    from lerobot.rollout import SyncInferenceConfig
++
++    cfg = MagicMock()
++    cfg.type = "diffusion"
++    with pytest.raises(ValueError, match="only ACT policies"):
++        _make_engine_from_config(SyncInferenceConfig(chunked_action_cache=True), cfg)
++
++
++def test_chunked_cache_rejects_temporal_ensembling():
++    from lerobot.rollout import SyncInferenceConfig
++
++    cfg = _make_act_policy_config(n_action_steps=1, temporal_ensemble_coeff=0.01)
++    with pytest.raises(ValueError, match="temporal ensembling"):
++        _make_engine_from_config(SyncInferenceConfig(chunked_action_cache=True), cfg)
++
++
++def _build_chunk_engine_with_stub_policy(
++    n_action_steps, chunk_len, action_dim, prefetch_watermark=None, gate=None
++):
++    """Build a SyncInferenceEngine in chunked mode with a deterministic stub policy.
++
++    The stub's chunk values encode the forward-pass count (call ``c`` yields
++    row ``t`` == ``c * 1000 + t * 10 + i``) so tests can verify which chunk and
++    which row an action came from.  When ``gate`` (a ``threading.Event``) is
++    given, the stub blocks on it, letting tests control prefetch-worker timing.
++    """
++    from lerobot.rollout import SyncInferenceEngine
++    from lerobot.utils.constants import ACTION
++
++    call_count = {"n": 0}
++
++    def predict(_obs):
++        if gate is not None:
++            assert gate.wait(timeout=5.0), "test gate never opened"
++        call_count["n"] += 1
++        c = call_count["n"]
++        return torch.stack(
++            [torch.arange(action_dim, dtype=torch.float32) + c * 1000 + t * 10 for t in range(chunk_len)]
++        ).unsqueeze(0)  # (1, chunk_len, action_dim)
++
++    policy = MagicMock()
++    policy.predict_action_chunk = MagicMock(side_effect=predict)
++
++    action_names = [f"a{i}" for i in range(action_dim)]
++    dataset_features = {ACTION: {"names": action_names, "dtype": "float32", "shape": (action_dim,)}}
++
++    engine = SyncInferenceEngine(
++        policy=policy,
++        preprocessor=MagicMock(side_effect=lambda x: x),
++        postprocessor=MagicMock(side_effect=lambda x: x),
++        dataset_features=dataset_features,
++        ordered_action_keys=action_names,
++        task="test",
++        device="cpu",
++        robot_type="mock",
++        chunk_action_steps=n_action_steps,
++        prefetch_watermark=prefetch_watermark,
++    )
++    return engine, policy, call_count
++
++
++def test_chunked_cache_serves_from_cache_and_refills():
++    import numpy as np
++
++    engine, policy, _ = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
++    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
++
++    # First call runs the policy and caches n_action_steps actions.
++    a0 = engine.get_action(obs_frame)
++    assert policy.predict_action_chunk.call_count == 1
++    torch.testing.assert_close(a0, torch.tensor([1000.0, 1001.0]))
++
++    # Next two calls are served from the cache (policy NOT re-run).
++    a1 = engine.get_action(obs_frame)
++    a2 = engine.get_action(obs_frame)
++    assert policy.predict_action_chunk.call_count == 1
++    torch.testing.assert_close(a1, torch.tensor([1010.0, 1011.0]))
++    torch.testing.assert_close(a2, torch.tensor([1020.0, 1021.0]))
++
++    # Cache exhausted -> policy runs again, slice restarts at row 0.
++    a3 = engine.get_action(obs_frame)
++    assert policy.predict_action_chunk.call_count == 2
++    torch.testing.assert_close(a3, torch.tensor([2000.0, 2001.0]))
++
++
++def test_chunked_cache_slices_to_n_action_steps():
++    import numpy as np
++
++    # chunk has 5 rows but n_action_steps=2 -> only 2 cached before refilling.
++    engine, policy, _ = _build_chunk_engine_with_stub_policy(n_action_steps=2, chunk_len=5, action_dim=2)
++    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
++
++    engine.get_action(obs_frame)
++    engine.get_action(obs_frame)
++    assert policy.predict_action_chunk.call_count == 1
++    engine.get_action(obs_frame)  # cache empty after 2 -> refill
++    assert policy.predict_action_chunk.call_count == 2
++
++
++def test_chunked_cache_none_obs_returns_none_without_running_policy():
++    engine, policy, _ = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
++    assert engine.get_action(None) is None
++    assert policy.predict_action_chunk.call_count == 0
++
++
++def test_reset_clears_action_cache():
++    import numpy as np
++
++    engine, _, _ = _build_chunk_engine_with_stub_policy(n_action_steps=3, chunk_len=5, action_dim=2)
++    obs_frame = {"observation.state": np.zeros(2, dtype=np.float32)}
++    engine.get_action(obs_frame)  # fills cache (2 left)
++    assert len(engine._action_cache) == 2
++    engine.reset()
++    assert len(engine._action_cache) == 0
++
++
++# ---------------------------------------------------------------------------
++# Background chunk prefetch
++# ---------------------------------------------------------------------------
++
++
++def test_prefetch_requires_chunked_cache():
++    from lerobot.rollout import SyncInferenceConfig
++
++    with pytest.raises(ValueError, match="requires inference.chunked_action_cache"):
++        _make_engine_from_config(
++            SyncInferenceConfig(chunked_action_cache=False, prefetch_chunks=True),
++            _make_act_policy_config(),
++        )
++
++
++@pytest.mark.parametrize("watermark", [0, 50, 51])
++def test_prefetch_watermark_bounds(watermark):
++    from lerobot.rollout import SyncInferenceConfig
++
++    with pytest.raises(ValueError, match="prefetch_watermark"):
++        _make_engine_from_config(
++            SyncInferenceConfig(
++                chunked_action_cache=True, prefetch_chunks=True, prefetch_watermark=watermark
++            ),
++            _make_act_policy_config(n_action_steps=50),
++        )
++
++
++def test_prefetch_factory_wiring():
++    from lerobot.rollout import SyncInferenceConfig
++
++    engine = _make_engine_from_config(
++        SyncInferenceConfig(chunked_action_cache=True, prefetch_chunks=True, prefetch_watermark=10),
++        _make_act_policy_config(n_action_steps=50),
++    )
++    assert engine._prefetch_watermark == 10
++
++
++def _wait_for_prefetch_result(engine, timeout=5.0):
++    import time
++
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if not engine._result_q.empty():
++            return
++        time.sleep(0.005)
++    raise AssertionError("timed out waiting for prefetch worker")
++
++
++def test_prefetch_first_chunk_serves_from_index_zero():
++    import numpy as np
++
++    engine, policy, _ = _build_chunk_engine_with_stub_policy(
++        n_action_steps=5, chunk_len=5, action_dim=2, prefetch_watermark=2
++    )
++    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
++    engine.start()
++    try:
++        # First tick: nothing cached, request submitted, no action yet.
++        assert engine.get_action(obs) is None
++        _wait_for_prefetch_result(engine)
++        # Empty cache at snapshot -> skip 0 -> chunk 1 served from row 0.
++        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1000.0, 1001.0]))
++        assert policy.predict_action_chunk.call_count >= 1
++    finally:
++        engine.stop()
++
++
++def test_prefetch_skips_overlapping_actions_at_watermark():
++    import threading
++
++    import numpy as np
++
++    gate = threading.Event()
++    gate.set()  # first chunk computes immediately
++    engine, _, calls = _build_chunk_engine_with_stub_policy(
++        n_action_steps=5, chunk_len=5, action_dim=2, prefetch_watermark=2, gate=gate
++    )
++    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
++    engine.start()
++    try:
++        assert engine.get_action(obs) is None
++        _wait_for_prefetch_result(engine)
++
++        # Serve rows 0..2 of chunk 1; cache drops 5 -> 2.
++        for t in range(3):
++            torch.testing.assert_close(
++                engine.get_action(obs), torch.tensor([1000.0 + t * 10, 1001.0 + t * 10])
++            )
++
++        # Block the worker, then hit the watermark tick: cache len == 2 -> submit
++        # with skip=2 while rows 3 and 4 are still served from the old cache.
++        gate.clear()
++        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1030.0, 1031.0]))
++        torch.testing.assert_close(engine.get_action(obs), torch.tensor([1040.0, 1041.0]))
++
++        # Worker still blocked: cache empty -> no action (robot holds pose).
++        assert engine.get_action(obs) is None
++
++        gate.set()
++        _wait_for_prefetch_result(engine)
++        # Chunk 2 rows 0 and 1 cover ticks already served from chunk 1 -> skipped.
++        torch.testing.assert_close(engine.get_action(obs), torch.tensor([2020.0, 2021.0]))
++        assert calls["n"] == 2
++    finally:
++        engine.stop()
++
++
++def test_prefetch_reset_discards_inflight_chunk():
++    import threading
++
++    import numpy as np
++
++    gate = threading.Event()
++    engine, _, calls = _build_chunk_engine_with_stub_policy(
++        n_action_steps=5, chunk_len=5, action_dim=2, prefetch_watermark=2, gate=gate
++    )
++    obs = {"observation.state": np.zeros(2, dtype=np.float32)}
++    engine.start()
++    try:
++        assert engine.get_action(obs) is None  # submits request; worker blocked on gate
++        engine.reset()  # invalidates the in-flight generation
++        gate.set()
++        _wait_for_prefetch_result(engine)
++        # Stale chunk 1 is discarded; this call re-submits with the new generation.
++        assert engine.get_action(obs) is None
++        _wait_for_prefetch_result(engine)
++        # Fresh chunk (2nd forward) served from row 0.
++        torch.testing.assert_close(engine.get_action(obs), torch.tensor([2000.0, 2001.0]))
++        assert calls["n"] == 2
++    finally:
++        engine.stop()
++
++
++def test_prefetch_worker_error_propagates():
++    import numpy as np
++
++    from lerobot.rollout import SyncInferenceEngine
++    from lerobot.utils.constants import ACTION
++
++    policy = MagicMock()
++    policy.predict_action_chunk = MagicMock(side_effect=RuntimeError("boom"))
++    engine = SyncInferenceEngine(
++        policy=policy,
++        preprocessor=MagicMock(side_effect=lambda x: x),
++        postprocessor=MagicMock(side_effect=lambda x: x),
++        dataset_features={ACTION: {"names": ["a0"], "dtype": "float32", "shape": (1,)}},
++        ordered_action_keys=["a0"],
++        task="test",
++        device="cpu",
++        robot_type="mock",
++        chunk_action_steps=5,
++        prefetch_watermark=2,
++    )
++    obs = {"observation.state": np.zeros(1, dtype=np.float32)}
++    engine.start()
++    try:
++        assert engine.get_action(obs) is None
++        _wait_for_prefetch_result(engine)
++        with pytest.raises(RuntimeError, match="prefetch worker failed"):
++            engine.get_action(obs)
++    finally:
++        engine.stop()
++
++
+ # ---------------------------------------------------------------------------
+ # Pure functions
+ # ---------------------------------------------------------------------------
+--
+2.39.3 (Apple Git-145)
