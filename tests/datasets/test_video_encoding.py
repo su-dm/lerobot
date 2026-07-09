@@ -17,6 +17,7 @@
 """Unit tests for ``lerobot.datasets.video_utils`` encoding functions and ``lerobot.configs.video.VideoEncoderConfig`` config class."""
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,20 @@ class TestCodecOptions:
         assert opts["g"] == 2
         assert opts["q:v"] == 40
         assert "crf" not in opts
+
+    @require_videotoolbox
+    def test_videotoolbox_options_as_strings(self):
+        """The streaming encoder passes as_strings=True; PyAV rejects non-str option values."""
+        cfg = VideoEncoderConfig(vcodec="h264_videotoolbox", g=2, crf=30, preset=None)
+        opts = cfg.get_codec_options(as_strings=True)
+        assert opts["q:v"] == "40"
+        assert all(isinstance(v, str) for v in opts.values())
+
+    @_require_encoder("h264_nvenc")
+    def test_nvenc_options_as_strings(self):
+        cfg = VideoEncoderConfig(vcodec="h264_nvenc", g=2, crf=25, preset=None)
+        opts = cfg.get_codec_options(as_strings=True)
+        assert all(isinstance(v, str) for v in opts.values())
 
     @_require_encoder("h264_nvenc")
     def test_nvenc_options(self):
@@ -343,6 +358,32 @@ def _encode_video(
     return path
 
 
+def _top_level_box_order(path: Path) -> list[str]:
+    """Return the top-level MP4 box types of ``path`` in file order."""
+    boxes = []
+    with open(path, "rb") as f:
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                break
+            size = int.from_bytes(header[:4], "big")
+            boxes.append(header[4:8].decode("latin-1"))
+            if size == 1:  # 64-bit largesize follows the header
+                size = int.from_bytes(f.read(8), "big")
+                f.seek(size - 16, 1)
+            elif size == 0:  # box extends to end of file
+                break
+            else:
+                f.seek(size - 8, 1)
+    return boxes
+
+
+def _is_faststart(path: Path) -> bool:
+    """True if the moov atom precedes the mdat atom (streaming-friendly layout)."""
+    boxes = _top_level_box_order(path)
+    return boxes.index("moov") < boxes.index("mdat")
+
+
 def _read_feature_info(dataset: LeRobotDataset) -> dict:
     info = json.loads((dataset.root / INFO_PATH).read_text())
     return info["features"][VIDEO_KEY]["info"]
@@ -554,6 +595,37 @@ class TestConcatenateVideoFiles:
         assert info["video.codec"] == "av1"
         assert info["video.pix_fmt"] == "yuv420p"
 
+    def test_faststart_default_moov_first(self, tmp_path):
+        out = tmp_path / "out.mp4"
+        clip = TEST_ARTIFACTS_DIR / "clip_4frames.mp4"
+        concatenate_video_files([clip, clip], out)
+
+        assert _is_faststart(out)
+
+    def test_no_faststart_moov_after_mdat(self, tmp_path):
+        out = tmp_path / "out.mp4"
+        clip = TEST_ARTIFACTS_DIR / "clip_4frames.mp4"
+        concatenate_video_files([clip, clip], out, faststart=False)
+
+        assert not _is_faststart(out)
+        with av.open(str(out)) as container:
+            total = sum(1 for _ in container.decode(video=0))
+        assert total == 8
+
+    def test_inplace_single_input_applies_faststart(self, tmp_path):
+        """Remuxing a file onto itself preserves frames and relocates the moov atom."""
+        video = tmp_path / "video.mp4"
+        shutil.copy(TEST_ARTIFACTS_DIR / "clip_6frames.mp4", video)
+        concatenate_video_files([video, video], video, faststart=False)
+        assert not _is_faststart(video)
+
+        concatenate_video_files([video], video)
+
+        assert _is_faststart(video)
+        with av.open(str(video)) as container:
+            total = sum(1 for _ in container.decode(video=0))
+        assert total == 12
+
     def test_compatibility_check_raises_on_different_codec(self, tmp_path):
         with pytest.raises(ValueError):
             concatenate_video_files(
@@ -615,6 +687,47 @@ class TestEncoderConfigPersistence:
         dataset.finalize()
 
         assert _read_feature_info(dataset) == first_info
+
+
+class TestFaststartAppliedOnFinalize:
+    """Recording-time concatenation skips faststart (avoiding a second full rewrite of the
+    growing chunk file per episode); finalize() must apply it once to every touched file.
+    """
+
+    @require_libsvtav1
+    def test_chunk_videos_moov_first_after_finalize(self, tmp_path, empty_lerobot_dataset_factory):
+        dataset = empty_lerobot_dataset_factory(
+            root=tmp_path / "ds", features=VIDEO_FEATURES, use_videos=True
+        )
+
+        for _ in range(3):
+            _add_frames(dataset, num_frames=4)
+            dataset.save_episode()
+
+        # Episodes 1-2 are concatenated onto the chunk file without faststart during recording
+        video_files = list((dataset.root / "videos").rglob("*.mp4"))
+        assert len(video_files) == 1
+        assert not _is_faststart(video_files[0])
+
+        dataset.finalize()
+
+        assert _is_faststart(video_files[0])
+        assert dataset.writer._videos_pending_faststart == set()
+
+    @require_libsvtav1
+    def test_finalize_idempotent_with_videos(self, tmp_path, empty_lerobot_dataset_factory):
+        dataset = empty_lerobot_dataset_factory(
+            root=tmp_path / "ds", features=VIDEO_FEATURES, use_videos=True
+        )
+        _add_frames(dataset, num_frames=4)
+        dataset.save_episode()
+
+        dataset.finalize()
+        dataset.finalize()
+
+        video_files = list((dataset.root / "videos").rglob("*.mp4"))
+        assert len(video_files) == 1
+        assert _is_faststart(video_files[0])
 
 
 class TestFromVideoInfo:

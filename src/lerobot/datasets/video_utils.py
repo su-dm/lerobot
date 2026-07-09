@@ -585,6 +585,7 @@ def concatenate_video_files(
     output_video_path: Path,
     overwrite: bool = True,
     compatibility_check: bool = False,
+    faststart: bool = True,
 ):
     """
     Concatenate multiple video files into a single video file using pyav.
@@ -598,6 +599,9 @@ def concatenate_video_files(
         output_video_path: Path to the output video file.
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
         compatibility_check: Whether to check if the input videos are compatible. Default is False.
+        faststart: Whether to move the mp4 metadata (moov atom) to the beginning of the file to
+            speed up loading over HTTP. Requires a full second rewrite of the output file, so
+            disable it for intermediate files that will be concatenated again.
 
     Note:
         - Creates a temporary directory for intermediate files that is cleaned up after use.
@@ -649,8 +653,8 @@ def concatenate_video_files(
         tmp_output_video_path = tmp_named_file.name
 
     output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+        tmp_output_video_path, mode="w", options={"movflags": "faststart"} if faststart else None
+    )
 
     # Replicate input streams in output container
     stream_map = {}

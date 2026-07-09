@@ -133,6 +133,7 @@ class DatasetWriter:
         self._current_file_start_frame: int | None = None
         self._episodes_since_last_encoding: int = 0
         self._recorded_frames: int = initial_frames
+        self._videos_pending_faststart: set[Path] = set()
         self._finalized = False
 
     def _create_episode_buffer(self, episode_index: int | None = None) -> dict:
@@ -481,6 +482,7 @@ class DatasetWriter:
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(ep_path), str(new_path))
+            self._videos_pending_faststart.add(new_path)
         else:
             latest_ep = self._meta.latest_episode
             chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
@@ -499,12 +501,17 @@ class DatasetWriter:
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(ep_path), str(new_path))
+                self._videos_pending_faststart.add(new_path)
                 latest_duration_in_s = 0.0
             else:
+                # Skip faststart here: it would rewrite the whole growing file a second time on
+                # every episode. The moov relocation is applied once per file in finalize().
                 concatenate_video_files(
                     [latest_path, ep_path],
                     latest_path,
+                    faststart=False,
                 )
+                self._videos_pending_faststart.add(latest_path)
 
         # Remove temporary directory
         shutil.rmtree(str(ep_path.parent))
@@ -611,6 +618,21 @@ class DatasetWriter:
             )
             self._batch_save_episode_video(start_ep, end_ep)
 
+    def _apply_faststart_to_pending_videos(self) -> None:
+        """Remux video files written during recording so their moov atom comes first.
+
+        Recording-time concatenation skips faststart to avoid rewriting the growing
+        file twice per episode, so each touched file gets a single faststart pass here.
+        """
+        for video_path in sorted(self._videos_pending_faststart):
+            if not video_path.exists():
+                continue
+            try:
+                concatenate_video_files([video_path], video_path)
+            except Exception as e:
+                logger.warning(f"Failed to apply faststart to {video_path}: {e}")
+        self._videos_pending_faststart.clear()
+
     def cancel_pending_videos(self) -> None:
         """Cancel any in-progress streaming encoding without flushing."""
         if self._streaming_encoder is not None:
@@ -642,9 +664,11 @@ class DatasetWriter:
             self.image_writer = None
         # 2. Flush pending video encoding (streaming or batch)
         self.flush_pending_videos()
-        # 3. Close own parquet writer
+        # 3. Apply faststart to video files written without it during recording
+        self._apply_faststart_to_pending_videos()
+        # 4. Close own parquet writer
         self.close_writer()
-        # 4. Finalize metadata (idempotent)
+        # 5. Finalize metadata (idempotent)
         self._meta.finalize()
         self._finalized = True
 
