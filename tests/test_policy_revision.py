@@ -63,6 +63,45 @@ def test_from_pretrained_revision_kwarg_is_persisted(act_config_file):
     assert cfg.revision == "v1.0"
 
 
+def test_save_pretrained_does_not_persist_revision(tmp_path):
+    # A config fine-tuned from `--policy.revision=X` must not bake X into the saved config.json:
+    # on reload, X would be looked up as a ref of the *new* repo and 404.
+    cfg = ACTConfig()
+    cfg.revision = "chunk100"
+    cfg._save_pretrained(tmp_path)
+
+    assert cfg.revision == "chunk100"  # in-memory config untouched
+    saved = (tmp_path / "config.json").read_text()
+    assert '"chunk100"' not in saved
+
+
+def test_from_pretrained_ignores_stale_revision_in_config_file(tmp_path):
+    # Even if an already-uploaded config.json carries a stale revision (from before the fix),
+    # loading without an explicit revision must not adopt it.
+    ACTConfig()._save_pretrained(tmp_path)
+    config_file = tmp_path / "config.json"
+    stale = config_file.read_text().replace('"revision": null', '"revision": "chunk100"')
+    assert '"chunk100"' in stale
+    config_file.write_text(stale)
+
+    with patch("lerobot.configs.policies.hf_hub_download", return_value=str(config_file)) as mock_dl:
+        cfg = PreTrainedConfig.from_pretrained("org/model")
+
+    assert mock_dl.call_args.kwargs["revision"] is None
+    assert cfg.revision is None
+
+
+def test_from_pretrained_explicit_revision_overrides_stale_config_value(tmp_path):
+    ACTConfig()._save_pretrained(tmp_path)
+    config_file = tmp_path / "config.json"
+    config_file.write_text(config_file.read_text().replace('"revision": null', '"revision": "chunk100"'))
+
+    with patch("lerobot.configs.policies.hf_hub_download", return_value=str(config_file)):
+        cfg = PreTrainedConfig.from_pretrained("org/model", revision="v2")
+
+    assert cfg.revision == "v2"
+
+
 @RewardModelConfig.register_subclass(name="_rev_test_reward")
 @dataclass
 class _RevRewardConfig(RewardModelConfig):

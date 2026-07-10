@@ -105,8 +105,15 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         pass
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # `revision` records which ref of the *source* repo the weights were loaded from; if
+        # persisted, reloading the saved model would look up that ref on the new repo.
+        revision = self.revision
+        self.revision = None
+        try:
+            with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
+                draccus.dump(self, f, indent=4)
+        finally:
+            self.revision = revision
 
     @classmethod
     def from_pretrained(
@@ -169,7 +176,8 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         with draccus.config_type("json"):
             parsed = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
 
-        # This covers the case where `revision` was passed as an explicit kwarg rather than a CLI override.
-        if parsed.revision is None and revision is not None:
-            parsed.revision = revision
+        # `revision` on the returned config must reflect what *this* load requested (explicit
+        # kwarg or CLI override, both captured in `revision`), never a value baked into the
+        # fetched config file by a previous training run — that ref belongs to the source repo.
+        parsed.revision = revision
         return parsed
